@@ -1,0 +1,25 @@
+Project: Build a VPN server using Hysteria protocol for high-speed performance. All authentication via keys; one key supports unlimited devices. Maximize optimization and autonomy. Ensure full crash resilience. Launch via single .sh file that installs all dependencies and fully deploys on Ubuntu 24.04. No traffic limits.
+Instructions for Claude Code Agent:
+
+Research Hysteria 2 protocol (QUIC-based for speed/low-latency). Use official docs: https://hysteria.network/.
+Design server-side setup:
+Authentication: Single shared key (pre-shared key mode) for all clients.
+Optimization: Enable fast-open, congestion control (BBR), multi-threading.
+Autonomy: Run as systemd service for auto-restart on crashes.
+Resilience: Handle restarts, errors gracefully; use watchdog if needed.
+
+Client compatibility: Assume standard Hysteria clients (e.g., Android/iOS apps, CLI).
+.sh Script Structure:
+Check Ubuntu 24.04.
+Install dependencies: Go (for building Hysteria), iptables, systemd, etc.
+Download/build Hysteria binary from source.
+Generate config: JSON/YAML with key, ports (e.g., UDP 443), obfuscation.
+Set up firewall rules for traffic forwarding.
+Create systemd service for auto-start/resilience.
+No traffic accounting/limits.
+
+Config Example:
+Server: Listen on UDP, use ACME for TLS if needed, but key-based auth primary.
+Key: Generate random PSK.
+
+Output: Full .sh file code, sample config, usage guide. Test mentally for completeness.
