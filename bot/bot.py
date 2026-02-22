@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
@@ -42,7 +43,7 @@ log = logging.getLogger("hysteria-bot")
 # ── Globals ─────────────────────────────────────────────────────────────────
 cfg = load_config()
 db = KeyDatabase(cfg.get("db_path", f"{DATA_DIR}/keys.db"))
-bot = Bot(token=cfg["bot_token"], parse_mode=ParseMode.HTML)
+bot = Bot(token=cfg["bot_token"], default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)

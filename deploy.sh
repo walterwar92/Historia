@@ -366,6 +366,8 @@ setup_bot_service() {
 Description=Hysteria 2 Telegram Bot & Auth Backend
 After=network.target network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=15
 
 [Service]
 Type=simple
@@ -375,8 +377,6 @@ Environment=HYSTERIA_BOT_DATA=${BOT_DIR}
 ExecStart=${BOT_DIR}/venv/bin/python3 ${BOT_DIR}/bot.py
 Restart=always
 RestartSec=3
-StartLimitIntervalSec=60
-StartLimitBurst=15
 LimitNOFILE=65535
 
 NoNewPrivileges=true
