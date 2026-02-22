@@ -235,16 +235,17 @@ obfs:
 
 # QUIC tuning — optimized for low latency
 quic:
-  initStreamReceiveWindow: 2097152
-  maxStreamReceiveWindow: 4194304
-  initConnReceiveWindow: 4194304
-  maxConnReceiveWindow: 8388608
-  maxIdleTimeout: 30s
+  initStreamReceiveWindow: 524288
+  maxStreamReceiveWindow: 2097152
+  initConnReceiveWindow: 1048576
+  maxConnReceiveWindow: 4194304
+  maxIdleTimeout: 90s
   maxIncomingStreams: 1024
   disablePathMTUDiscovery: false
 
-# Let server decide bandwidth — avoids Brutal without client bandwidth set
-ignoreClientBandwidth: true
+# Do NOT ignore client bandwidth — let client report its bandwidth
+# so Hysteria uses proper congestion control instead of blind Brutal
+ignoreClientBandwidth: false
 
 # Traffic Stats API
 trafficStats:

@@ -236,10 +236,10 @@ def build_client_config(key: str) -> str:
         )
     config_text += (
         "quic:\n"
-        "  initStreamReceiveWindow: 2097152\n"
-        "  maxStreamReceiveWindow: 4194304\n"
-        "  initConnReceiveWindow: 4194304\n"
-        "  maxConnReceiveWindow: 8388608\n\n"
+        "  initStreamReceiveWindow: 524288\n"
+        "  maxStreamReceiveWindow: 2097152\n"
+        "  initConnReceiveWindow: 1048576\n"
+        "  maxConnReceiveWindow: 4194304\n\n"
         "fastOpen: true\n\n"
         "socks5:\n  listen: 127.0.0.1:1080\n\n"
         "http:\n  listen: 127.0.0.1:8080\n"
