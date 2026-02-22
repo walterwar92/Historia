@@ -310,6 +310,7 @@ TOML
     chmod 600 "${TT_HOSTS_TOML}"
 
     # Create empty credentials file (bot will populate it)
+    mkdir -p "$(dirname "${TT_CREDENTIALS}")"
     touch "${TT_CREDENTIALS}"
     chmod 600 "${TT_CREDENTIALS}"
 
