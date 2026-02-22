@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "WebFetch(domain:hysteria.network)"
+      "WebFetch(domain:hysteria.network)",
+      "WebFetch(domain:github.com)"
     ]
   }
 }

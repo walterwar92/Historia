@@ -23,6 +23,9 @@ DEFAULTS = {
     "server_port": 443,
     "obfs_password": "",
     "log_lines": 50,
+    "tt_credentials_path": "/etc/hysteria/bot/tt_credentials.txt",
+    "tt_service": "trusttunnel",
+    "tt_server_port": 443,
 }
 
 
@@ -46,12 +49,15 @@ def load_config() -> dict:
         "SERVER_IP": "server_ip",
         "SERVER_PORT": "server_port",
         "OBFS_PASSWORD": "obfs_password",
+        "TT_CREDENTIALS_PATH": "tt_credentials_path",
+        "TT_SERVICE": "tt_service",
+        "TT_SERVER_PORT": "tt_server_port",
     }
     for env_key, cfg_key in env_map.items():
         val = os.environ.get(env_key)
         if val is not None:
             # Cast int fields
-            if cfg_key in ("auth_backend_port", "server_port", "log_lines"):
+            if cfg_key in ("auth_backend_port", "server_port", "log_lines", "tt_server_port"):
                 val = int(val)
             cfg[cfg_key] = val
 

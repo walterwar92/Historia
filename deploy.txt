@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  Hysteria 2 + TrustTunnel VPN — One-Click Deploy Script for Ubuntu 24.04
-#  Protocols:
-#    Hysteria 2  — QUIC/UDP:443 — max speed, Salamander obfuscation
-#    TrustTunnel — HTTP/2 TCP:443 — DPI bypass, looks like regular HTTPS
-#  Features: Self-signed TLS, HTTP auth backend, multi-key via Telegram bot,
-#            systemd services, traffic stats API, auto-update, management CLI
+#  Hysteria 2 VPN Server — One-Click Deploy Script for Ubuntu 24.04
+#  Features: Self-signed TLS, Salamander obfuscation, HTTP auth backend,
+#            multi-key via Telegram bot, systemd services, traffic stats API,
+#            auto-update cron, management commands
 # ============================================================================
 set -euo pipefail
 
@@ -41,15 +39,6 @@ OBFS_PASSWORD=""
 BOT_TOKEN=""
 ADMIN_PASSWORD=""
 SERVER_IP=""
-
-# ── TrustTunnel constants ─────────────────────────────────────────────────
-TT_DIR="/opt/trusttunnel"
-TT_SERVICE_NAME="trusttunnel"
-TT_SERVICE_FILE="/etc/systemd/system/${TT_SERVICE_NAME}.service"
-TT_VPN_TOML="${TT_DIR}/vpn.toml"
-TT_HOSTS_TOML="${TT_DIR}/hosts.toml"
-TT_CREDENTIALS="${BOT_DIR}/tt_credentials.txt"
-TT_LISTEN_PORT=443
 
 # ── Pre-flight checks ──────────────────────────────────────────────────────
 preflight() {
@@ -143,35 +132,6 @@ install_hysteria() {
     info "Hysteria installed: $("${HYSTERIA_BIN}" version 2>/dev/null | head -1 || echo 'OK')"
 }
 
-# ── Download TrustTunnel binary ───────────────────────────────────────────
-install_trusttunnel() {
-    if [[ -f "${TT_DIR}/trusttunnel_endpoint" ]]; then
-        info "TrustTunnel already installed. Re-downloading latest version..."
-    fi
-
-    info "Downloading TrustTunnel via official installer..."
-    curl -fsSL https://raw.githubusercontent.com/TrustTunnel/TrustTunnel/refs/heads/master/scripts/install.sh | sh -s - -o "${TT_DIR}" || {
-        warn "TrustTunnel official installer failed. Trying direct download..."
-        local ARCH
-        ARCH=$(uname -m)
-        case "${ARCH}" in
-            x86_64)  ARCH="linux-x86_64" ;;
-            aarch64) ARCH="linux-aarch64" ;;
-            *)       fatal "Unsupported architecture for TrustTunnel: ${ARCH}" ;;
-        esac
-        mkdir -p "${TT_DIR}"
-        local TT_URL="https://github.com/TrustTunnel/TrustTunnel/releases/latest/download/trusttunnel_endpoint-${ARCH}"
-        curl -fsSL -o "${TT_DIR}/trusttunnel_endpoint" "${TT_URL}"
-        chmod +x "${TT_DIR}/trusttunnel_endpoint"
-    }
-
-    if [[ ! -x "${TT_DIR}/trusttunnel_endpoint" ]]; then
-        fatal "TrustTunnel binary not found after installation."
-    fi
-
-    info "TrustTunnel installed at ${TT_DIR}/trusttunnel_endpoint"
-}
-
 # ── Generate secrets ───────────────────────────────────────────────────────
 generate_secrets() {
     OBFS_PASSWORD=$(openssl rand -hex 16)
@@ -263,59 +223,6 @@ YAML
     info "Configuration written to ${CONFIG_FILE}"
 }
 
-# ── Write TrustTunnel config ──────────────────────────────────────────────
-write_tt_config() {
-    info "Writing TrustTunnel configuration..."
-
-    mkdir -p "${TT_DIR}"
-
-    # vpn.toml — main endpoint settings
-    cat > "${TT_VPN_TOML}" <<TOML
-# TrustTunnel Endpoint Configuration
-# Traffic looks like regular HTTPS — bypasses DPI
-
-listen_address = "0.0.0.0:${TT_LISTEN_PORT}"
-ipv6_available = true
-allow_private_network_connections = false
-tls_handshake_timeout_secs = 10
-client_listener_timeout_secs = 600
-connection_establishment_timeout_secs = 30
-tcp_connections_timeout_secs = 604800
-udp_connections_timeout_secs = 300
-credentials_file = "${TT_CREDENTIALS}"
-
-[listen_protocols.http2]
-initial_connection_window_size = 4194304
-initial_stream_window_size = 2097152
-max_concurrent_streams = 512
-max_frame_size = 65536
-
-[forward_protocol]
-direct = {}
-TOML
-
-    chmod 600 "${TT_VPN_TOML}"
-
-    # hosts.toml — TLS host settings (reuses Hysteria's self-signed cert)
-    cat > "${TT_HOSTS_TOML}" <<TOML
-# TrustTunnel TLS Hosts
-# Uses same certificate as Hysteria
-
-[[main_hosts]]
-hostname = "${SERVER_IP}"
-cert_chain_path = "${CERT_FILE}"
-private_key_path = "${KEY_FILE}"
-TOML
-
-    chmod 600 "${TT_HOSTS_TOML}"
-
-    # Create empty credentials file (bot will populate it)
-    touch "${TT_CREDENTIALS}"
-    chmod 600 "${TT_CREDENTIALS}"
-
-    info "TrustTunnel config written: ${TT_VPN_TOML}, ${TT_HOSTS_TOML}"
-}
-
 # ── Install Telegram bot ──────────────────────────────────────────────────
 install_bot() {
     info "Installing Telegram bot..."
@@ -354,10 +261,7 @@ install_bot() {
   "server_ip": "${SERVER_IP}",
   "server_port": ${LISTEN_PORT},
   "obfs_password": "${OBFS_PASSWORD}",
-  "log_lines": 50,
-  "tt_credentials_path": "${TT_CREDENTIALS}",
-  "tt_service": "${TT_SERVICE_NAME}",
-  "tt_server_port": ${TT_LISTEN_PORT}
+  "log_lines": 50
 }
 BOTJSON
 
@@ -379,22 +283,14 @@ setup_firewall() {
         echo "net.ipv6.conf.all.forwarding=1" >> /etc/sysctl.conf
     fi
 
-    # UDP 443 — Hysteria (QUIC)
     iptables -C INPUT -p udp --dport "${LISTEN_PORT}" -j ACCEPT 2>/dev/null || \
         iptables -I INPUT 1 -p udp --dport "${LISTEN_PORT}" -j ACCEPT
-
-    # TCP 443 — TrustTunnel (HTTPS-like)
-    iptables -C INPUT -p tcp --dport "${TT_LISTEN_PORT}" -j ACCEPT 2>/dev/null || \
-        iptables -I INPUT 1 -p tcp --dport "${TT_LISTEN_PORT}" -j ACCEPT
 
     iptables -C INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
         iptables -I INPUT 1 -m state --state ESTABLISHED,RELATED -j ACCEPT
 
     ip6tables -C INPUT -p udp --dport "${LISTEN_PORT}" -j ACCEPT 2>/dev/null || \
         ip6tables -I INPUT 1 -p udp --dport "${LISTEN_PORT}" -j ACCEPT 2>/dev/null || true
-
-    ip6tables -C INPUT -p tcp --dport "${TT_LISTEN_PORT}" -j ACCEPT 2>/dev/null || \
-        ip6tables -I INPUT 1 -p tcp --dport "${TT_LISTEN_PORT}" -j ACCEPT 2>/dev/null || true
 
     if command -v netfilter-persistent &>/dev/null; then
         netfilter-persistent save 2>/dev/null || true
@@ -543,49 +439,6 @@ EOF
     info "Bot service file created."
 }
 
-# ── Systemd: TrustTunnel service ─────────────────────────────────────────
-setup_tt_service() {
-    info "Creating TrustTunnel systemd service..."
-
-    systemctl stop "${TT_SERVICE_NAME}" 2>/dev/null || true
-    systemctl disable "${TT_SERVICE_NAME}" 2>/dev/null || true
-
-    cat > "${TT_SERVICE_FILE}" <<EOF
-[Unit]
-Description=TrustTunnel VPN Endpoint
-Documentation=https://trusttunnel.org/
-After=network.target network-online.target ${BOT_SERVICE_NAME}.service
-Wants=network-online.target
-Requires=${BOT_SERVICE_NAME}.service
-
-[Service]
-Type=simple
-ExecStartPre=/bin/sleep 2
-ExecStart=${TT_DIR}/trusttunnel_endpoint ${TT_VPN_TOML} ${TT_HOSTS_TOML}
-Restart=always
-RestartSec=5
-StartLimitIntervalSec=60
-StartLimitBurst=10
-LimitNOFILE=65535
-LimitNPROC=65535
-
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=${TT_DIR} ${HYSTERIA_DIR}
-PrivateTmp=true
-
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=trusttunnel
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    info "TrustTunnel service file created."
-}
-
 # ── Start services ────────────────────────────────────────────────────────
 start_services() {
     info "Starting services..."
@@ -619,20 +472,6 @@ start_services() {
         journalctl -u "${SERVICE_NAME}" --no-pager -n 20
         fatal "Hysteria service startup failed. See logs above."
     fi
-
-    # Start TrustTunnel
-    systemctl enable "${TT_SERVICE_NAME}" > /dev/null 2>&1
-    systemctl restart "${TT_SERVICE_NAME}"
-
-    sleep 2
-
-    if systemctl is-active --quiet "${TT_SERVICE_NAME}"; then
-        info "TrustTunnel service started successfully."
-    else
-        err "TrustTunnel service failed to start. Checking logs..."
-        journalctl -u "${TT_SERVICE_NAME}" --no-pager -n 20
-        warn "TrustTunnel startup failed. Hysteria is still running. Check logs above."
-    fi
 }
 
 # ── Auto-update cron job ───────────────────────────────────────────────────
@@ -641,38 +480,29 @@ setup_autoupdate() {
 
     cat > "${CRON_SCRIPT}" <<'CRONEOF'
 #!/usr/bin/env bash
-# Auto-update Hysteria 2 + TrustTunnel binaries (runs daily)
+# Auto-update Hysteria 2 binary (runs daily)
 set -euo pipefail
 LOG="/var/log/hysteria-update.log"
 
 exec >> "${LOG}" 2>&1
 echo "=== Update check: $(date) ==="
 
-# Update Hysteria
 CURRENT=$(/usr/local/bin/hysteria version 2>/dev/null | head -1 || echo "unknown")
 
 bash <(curl -fsSL https://get.hy2.sh/) > /dev/null 2>&1 || {
-    echo "Hysteria update download failed, keeping current version."
+    echo "Update download failed, keeping current version."
+    exit 0
 }
 
 NEW=$(/usr/local/bin/hysteria version 2>/dev/null | head -1 || echo "unknown")
 
 if [[ "${CURRENT}" != "${NEW}" ]]; then
-    echo "Hysteria updated: ${CURRENT} -> ${NEW}"
+    echo "Updated: ${CURRENT} -> ${NEW}"
     systemctl restart hysteria-server 2>/dev/null || true
-    echo "Hysteria service restarted."
+    echo "Service restarted."
 else
-    echo "Hysteria already up to date: ${CURRENT}"
+    echo "Already up to date: ${CURRENT}"
 fi
-
-# Update TrustTunnel
-echo "Checking TrustTunnel updates..."
-systemctl stop trusttunnel 2>/dev/null || true
-curl -fsSL https://raw.githubusercontent.com/TrustTunnel/TrustTunnel/refs/heads/master/scripts/install.sh | sh -s - -o /opt/trusttunnel > /dev/null 2>&1 || {
-    echo "TrustTunnel update failed."
-}
-systemctl start trusttunnel 2>/dev/null || true
-echo "TrustTunnel update check done."
 CRONEOF
 
     chmod +x "${CRON_SCRIPT}"
@@ -695,11 +525,9 @@ CONFIG="/etc/hysteria/config.yaml"
 SERVICE="hysteria-server"
 BOT_SERVICE="hysteria-bot"
 BOT_DIR="/etc/hysteria/bot"
-TT_SERVICE="trusttunnel"
-TT_DIR="/opt/trusttunnel"
 
 usage() {
-    echo -e "${BOLD}Hysteria 2 + TrustTunnel VPN Management${NC}"
+    echo -e "${BOLD}Hysteria 2 VPN Management${NC}"
     echo ""
     echo "Usage: hysteria-manage <command>"
     echo ""
@@ -709,11 +537,10 @@ usage() {
     echo "  stop            Stop all services"
     echo "  restart         Restart all services"
     echo "  logs [N]        Show last N Hysteria log lines (default 50)"
-    echo "  tt-logs [N]     Show last N TrustTunnel log lines (default 50)"
     echo "  bot-logs [N]    Show last N bot log lines (default 50)"
-    echo "  show-config     Display server configs"
+    echo "  show-config     Display server config"
     echo "  stats           Show traffic stats"
-    echo "  update          Update Hysteria + TrustTunnel"
+    echo "  update          Update Hysteria to latest version"
     echo "  uninstall       Remove everything"
     echo ""
 }
@@ -722,15 +549,11 @@ cmd_status() {
     echo -e "${BOLD}=== Hysteria Service ===${NC}"
     systemctl status "${SERVICE}" --no-pager 2>/dev/null || echo -e "${RED}Not found${NC}"
     echo ""
-    echo -e "${BOLD}=== TrustTunnel Service ===${NC}"
-    systemctl status "${TT_SERVICE}" --no-pager 2>/dev/null || echo -e "${RED}Not found${NC}"
-    echo ""
     echo -e "${BOLD}=== Bot Service ===${NC}"
     systemctl status "${BOT_SERVICE}" --no-pager 2>/dev/null || echo -e "${RED}Not found${NC}"
     echo ""
     echo -e "${BOLD}=== Port Listening ===${NC}"
-    ss -ulnp | grep ":443\b" 2>/dev/null || echo "No UDP listeners on 443 (Hysteria)"
-    ss -tlnp | grep ":443\b" 2>/dev/null || echo "No TCP listeners on 443 (TrustTunnel)"
+    ss -ulnp | grep ":443\b" 2>/dev/null || echo "No UDP listeners on 443"
     ss -tlnp | grep ":8787\b" 2>/dev/null || echo "No TCP listeners on 8787 (auth backend)"
 }
 
@@ -744,17 +567,9 @@ cmd_bot_logs() {
     journalctl -u "${BOT_SERVICE}" --no-pager -n "${lines}"
 }
 
-cmd_tt_logs() {
-    local lines="${1:-50}"
-    journalctl -u "${TT_SERVICE}" --no-pager -n "${lines}"
-}
-
 cmd_show_config() {
-    echo -e "${BOLD}=== Hysteria Configuration ===${NC}"
+    echo -e "${BOLD}=== Server Configuration ===${NC}"
     cat "${CONFIG}"
-    echo ""
-    echo -e "${BOLD}=== TrustTunnel Configuration ===${NC}"
-    cat "${TT_DIR}/vpn.toml" 2>/dev/null || echo "Not found"
 }
 
 cmd_stats() {
@@ -782,23 +597,18 @@ cmd_update() {
     local current
     current=$(/usr/local/bin/hysteria version 2>/dev/null | head -1 || echo "unknown")
     bash <(curl -fsSL https://get.hy2.sh/) || {
-        echo -e "${RED}Hysteria update failed.${NC}"
+        echo -e "${RED}Update failed.${NC}"
+        return 1
     }
     local new_ver
     new_ver=$(/usr/local/bin/hysteria version 2>/dev/null | head -1 || echo "unknown")
-    echo -e "${GREEN}Hysteria: ${current} -> ${new_ver}${NC}"
-    systemctl restart "${SERVICE}" 2>/dev/null || true
-
-    echo -e "${YELLOW}Updating TrustTunnel...${NC}"
-    curl -fsSL https://raw.githubusercontent.com/TrustTunnel/TrustTunnel/refs/heads/master/scripts/install.sh | sh -s - -o "${TT_DIR}" || {
-        echo -e "${RED}TrustTunnel update failed.${NC}"
-    }
-    systemctl restart "${TT_SERVICE}" 2>/dev/null || true
+    echo -e "${GREEN}Updated: ${current} -> ${new_ver}${NC}"
+    systemctl restart "${SERVICE}"
     echo -e "${GREEN}Done.${NC}"
 }
 
 cmd_uninstall() {
-    echo -e "${RED}${BOLD}WARNING: This will completely remove Hysteria 2 + TrustTunnel + Bot.${NC}"
+    echo -e "${RED}${BOLD}WARNING: This will completely remove Hysteria 2 VPN + Bot.${NC}"
     read -rp "Are you sure? (yes/no): " confirm
     if [[ "${confirm}" != "yes" ]]; then
         echo "Aborted."
@@ -807,34 +617,29 @@ cmd_uninstall() {
 
     echo "Stopping services..."
     systemctl stop "${SERVICE}" 2>/dev/null || true
-    systemctl stop "${TT_SERVICE}" 2>/dev/null || true
     systemctl stop "${BOT_SERVICE}" 2>/dev/null || true
     systemctl disable "${SERVICE}" 2>/dev/null || true
-    systemctl disable "${TT_SERVICE}" 2>/dev/null || true
     systemctl disable "${BOT_SERVICE}" 2>/dev/null || true
 
     echo "Removing files..."
     rm -f "/etc/systemd/system/${SERVICE}.service"
-    rm -f "/etc/systemd/system/${TT_SERVICE}.service"
     rm -f "/etc/systemd/system/${BOT_SERVICE}.service"
     rm -rf /etc/hysteria
-    rm -rf /opt/trusttunnel
     rm -f /usr/local/bin/hysteria
     rm -f /usr/local/bin/hysteria-manage
     rm -f /etc/cron.daily/hysteria-update
 
     systemctl daemon-reload
 
-    echo -e "${GREEN}Hysteria 2 + TrustTunnel + Bot completely removed.${NC}"
+    echo -e "${GREEN}Hysteria 2 + Bot completely removed.${NC}"
 }
 
 case "${1:-}" in
     status)      cmd_status ;;
-    start)       systemctl start "${BOT_SERVICE}" && sleep 2 && systemctl start "${SERVICE}" && systemctl start "${TT_SERVICE}" && echo -e "${GREEN}All services started.${NC}" ;;
-    stop)        systemctl stop "${SERVICE}"; systemctl stop "${TT_SERVICE}"; systemctl stop "${BOT_SERVICE}" && echo -e "${YELLOW}All services stopped.${NC}" ;;
-    restart)     systemctl restart "${BOT_SERVICE}" && sleep 2 && systemctl restart "${SERVICE}" && systemctl restart "${TT_SERVICE}" && echo -e "${GREEN}All services restarted.${NC}" ;;
+    start)       systemctl start "${BOT_SERVICE}" && sleep 2 && systemctl start "${SERVICE}" && echo -e "${GREEN}Started.${NC}" ;;
+    stop)        systemctl stop "${SERVICE}" && systemctl stop "${BOT_SERVICE}" && echo -e "${YELLOW}Stopped.${NC}" ;;
+    restart)     systemctl restart "${BOT_SERVICE}" && sleep 2 && systemctl restart "${SERVICE}" && echo -e "${GREEN}Restarted.${NC}" ;;
     logs)        cmd_logs "${2:-50}" ;;
-    tt-logs)     cmd_tt_logs "${2:-50}" ;;
     bot-logs)    cmd_bot_logs "${2:-50}" ;;
     show-config) cmd_show_config ;;
     stats)       cmd_stats ;;
@@ -852,10 +657,9 @@ MGMTEOF
 print_summary() {
     echo ""
     echo -e "${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}║   Hysteria 2 + TrustTunnel VPN — Deployment Complete!       ║${NC}"
+    echo -e "${BOLD}║        Hysteria 2 VPN — Deployment Complete!                ║${NC}"
     echo -e "${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    echo -e "${BOLD}── Hysteria 2 (макс. скорость, QUIC/UDP) ──${NC}"
     echo -e "${CYAN}Server IP:${NC}            ${SERVER_IP}"
     echo -e "${CYAN}Port:${NC}                 ${LISTEN_PORT} (UDP)"
     echo -e "${CYAN}Auth:${NC}                 Multi-key (via Telegram bot)"
@@ -864,13 +668,6 @@ print_summary() {
     echo -e "${CYAN}TLS:${NC}                  Self-signed (insecure: true on client)"
     echo -e "${CYAN}Stats API:${NC}            http://127.0.0.1:${STATS_PORT}"
     echo -e "${CYAN}Auth Backend:${NC}         http://127.0.0.1:${AUTH_BACKEND_PORT}"
-    echo ""
-    echo -e "${BOLD}── TrustTunnel (обход DPI, HTTP/2 stealth) ──${NC}"
-    echo -e "${CYAN}Server IP:${NC}            ${SERVER_IP}"
-    echo -e "${CYAN}Port:${NC}                 ${TT_LISTEN_PORT} (TCP)"
-    echo -e "${CYAN}Protocol:${NC}             HTTP/2 (looks like regular HTTPS)"
-    echo -e "${CYAN}TLS:${NC}                  Self-signed (skip_verification on client)"
-    echo -e "${YELLOW}NOTE:${NC}                 Mobile Flutter app requires Let's Encrypt cert"
     echo ""
     echo -e "${BOLD}── Telegram Bot ──${NC}"
     echo -e "  ${CYAN}Bot Token:${NC}          ${BOT_TOKEN:0:10}...${BOT_TOKEN: -5}"
@@ -881,11 +678,10 @@ print_summary() {
     echo -e "${BOLD}── Management ──${NC}"
     echo -e "  ${GREEN}hysteria-manage status${NC}       — all services status"
     echo -e "  ${GREEN}hysteria-manage logs${NC}         — Hysteria logs"
-    echo -e "  ${GREEN}hysteria-manage tt-logs${NC}      — TrustTunnel logs"
     echo -e "  ${GREEN}hysteria-manage bot-logs${NC}     — Bot logs"
     echo -e "  ${GREEN}hysteria-manage stats${NC}        — traffic statistics"
     echo -e "  ${GREEN}hysteria-manage restart${NC}      — restart all services"
-    echo -e "  ${GREEN}hysteria-manage update${NC}       — update Hysteria + TrustTunnel"
+    echo -e "  ${GREEN}hysteria-manage update${NC}       — update Hysteria"
     echo -e "  ${GREEN}hysteria-manage uninstall${NC}    — remove everything"
     echo ""
     echo -e "${BOLD}── How It Works ──${NC}"
@@ -898,10 +694,9 @@ print_summary() {
 
     # Save credentials
     cat > "${HYSTERIA_DIR}/credentials.txt" <<CREDS
-# Hysteria 2 + TrustTunnel VPN Credentials
+# Hysteria 2 VPN Credentials
 # Generated: $(date)
 
-=== Hysteria 2 (QUIC/UDP — max speed) ===
 Server IP:         ${SERVER_IP}
 Port:              ${LISTEN_PORT} (UDP)
 Auth:              Multi-key (via Telegram bot)
@@ -910,14 +705,6 @@ Obfs Password:     ${OBFS_PASSWORD}
 Stats API:         http://127.0.0.1:${STATS_PORT}
 Stats Secret:      ${STATS_SECRET}
 Auth Backend:      http://127.0.0.1:${AUTH_BACKEND_PORT}
-
-=== TrustTunnel (HTTP/2 — DPI bypass) ===
-Server IP:         ${SERVER_IP}
-Port:              ${TT_LISTEN_PORT} (TCP)
-Protocol:          HTTP/2 (stealth HTTPS)
-TLS:               Self-signed (skip_verification)
-
-=== Telegram Bot ===
 Bot Token:         ${BOT_TOKEN}
 Admin Password:    ${ADMIN_PASSWORD}
 CREDS
@@ -929,7 +716,7 @@ CREDS
 main() {
     echo ""
     echo -e "${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}║  Hysteria 2 + TrustTunnel VPN — One-Click Deployment        ║${NC}"
+    echo -e "${BOLD}║     Hysteria 2 VPN + Telegram Bot — One-Click Deployment    ║${NC}"
     echo -e "${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 
@@ -937,17 +724,14 @@ main() {
     ask_bot_config
     install_deps
     install_hysteria
-    install_trusttunnel
     generate_secrets
     detect_server_ip
     generate_cert
     write_config
-    write_tt_config
     install_bot
     setup_firewall
     setup_hysteria_service
     setup_bot_service
-    setup_tt_service
     start_services
     setup_autoupdate
     create_management_script

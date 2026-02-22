@@ -272,6 +272,17 @@ class KeyDatabase:
             active = conn.execute("SELECT COUNT(*) FROM keys WHERE active = 1").fetchone()[0]
         return {"total": total, "active": active, "blocked": total - active}
 
+    def list_active_keys(self) -> list[dict]:
+        """Return all active, non-expired keys."""
+        now = time.time()
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM keys WHERE active = 1 "
+                "AND (expires_at = 0 OR expires_at > ?)",
+                (now,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def regenerate_key(self, key_id: int) -> Optional[dict]:
         """Delete old key and create a new one owned by the same user."""
         with self._conn() as conn:
