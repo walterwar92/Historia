@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """
-Hysteria 2 Telegram Bot — Main entry point
-
-Features:
-  - Password-protected access
-  - Multi-key management (create / list / delete / block)
-  - Client config & URI generation
-  - Server status, traffic stats, logs
-  - Inline keyboard UI
+Hysteria 2 Telegram Bot
+  - Role-based access (Admin / User)
+  - Invite-code registration
+  - Multi-key management
+  - Server monitoring
   - HTTP auth backend for Hysteria
 """
 import asyncio
@@ -29,7 +26,6 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
     TelegramObject,
-    Update,
 )
 
 from auth_backend import AuthBackend
@@ -46,55 +42,63 @@ log = logging.getLogger("hysteria-bot")
 # ── Globals ─────────────────────────────────────────────────────────────────
 cfg = load_config()
 db = KeyDatabase(cfg.get("db_path", f"{DATA_DIR}/keys.db"))
-bot = Bot(token=cfg["bot_token"], default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+bot = Bot(
+    token=cfg["bot_token"],
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
 dp = Dispatcher()
 router = Router()
 auth_backend = AuthBackend(db, port=cfg.get("auth_backend_port", 8787))
 
 ADMIN_PASSWORD = cfg["admin_password"]
 
-# Commands that don't require auth
-NO_AUTH_COMMANDS = {"start", "logout"}
+# ── Visual constants ────────────────────────────────────────────────────────
+LINE = "─" * 28
+HEADER_LINE = "━" * 28
 
 
 # ── Auth Middleware ─────────────────────────────────────────────────────────
 
 class AuthMiddleware(BaseMiddleware):
-    """Block non-authenticated users from accessing handlers (except /start, /logout, and password input)."""
-
     async def __call__(
         self,
         handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
         event: TelegramObject,
         data: dict[str, Any],
     ) -> Any:
-        # Determine telegram user id
         user = data.get("event_from_user")
         if user is None:
             return await handler(event, data)
 
         tg_id = user.id
 
-        # Allow /start and /logout through
+        # Always allow /start
         if isinstance(event, Message) and event.text:
             text = event.text.strip()
             if text.startswith("/"):
                 cmd = text.split()[0].lstrip("/").split("@")[0]
-                if cmd in NO_AUTH_COMMANDS:
+                if cmd in ("start",):
                     return await handler(event, data)
 
-        # Allow plain text through (for password input)
+        # Always allow plain text (for password / invite code input)
         if isinstance(event, Message) and event.text and not event.text.startswith("/"):
             return await handler(event, data)
 
-        # Check auth for everything else
-        if not db.is_authed(tg_id):
+        # Check registration
+        db_user = db.get_user(tg_id)
+        if not db_user:
             if isinstance(event, CallbackQuery):
-                await event.answer("Сначала авторизуйтесь. Отправьте /start", show_alert=True)
+                await event.answer(
+                    "Вы не зарегистрированы.\nОтправьте /start",
+                    show_alert=True,
+                )
             elif isinstance(event, Message):
-                await event.answer("Сначала авторизуйтесь. Отправьте /start")
+                await event.answer("Вы не зарегистрированы. Отправьте /start")
             return None
 
+        # Inject role into data for handlers
+        data["user_role"] = db_user["role"]
+        data["db_user"] = db_user
         return await handler(event, data)
 
 
@@ -105,10 +109,14 @@ dp.include_router(router)
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
-def ts_format(ts: float) -> str:
+def is_admin(role: str) -> bool:
+    return role == "admin"
+
+
+def ts_fmt(ts: float) -> str:
     if ts <= 0:
-        return "—"
-    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        return "---"
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%d.%m.%Y %H:%M")
 
 
 def human_bytes(n: int) -> str:
@@ -119,14 +127,35 @@ def human_bytes(n: int) -> str:
     return f"{n:.1f} PB"
 
 
-def main_menu_kb() -> InlineKeyboardMarkup:
+def get_username(user) -> str:
+    """Extract display name from Telegram user object or dict."""
+    if isinstance(user, dict):
+        return user.get("username", "") or ""
+    if hasattr(user, "username") and user.username:
+        return f"@{user.username}"
+    if hasattr(user, "first_name"):
+        return user.first_name or ""
+    return ""
+
+
+# ── Keyboards ───────────────────────────────────────────────────────────────
+
+def admin_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="Создать ключ", callback_data="key_create"),
-            InlineKeyboardButton(text="Список ключей", callback_data="key_list"),
+            InlineKeyboardButton(text="+ Создать ключ", callback_data="key_create"),
+            InlineKeyboardButton(text="Мои ключи", callback_data="my_keys"),
         ],
         [
-            InlineKeyboardButton(text="Статус сервера", callback_data="srv_status"),
+            InlineKeyboardButton(text="Все ключи", callback_data="key_list"),
+            InlineKeyboardButton(text="Пользователи", callback_data="user_list"),
+        ],
+        [
+            InlineKeyboardButton(text="Инвайт-коды", callback_data="invite_list"),
+            InlineKeyboardButton(text="+ Инвайт", callback_data="invite_create"),
+        ],
+        [
+            InlineKeyboardButton(text="Статус", callback_data="srv_status"),
             InlineKeyboardButton(text="Трафик", callback_data="srv_stats"),
         ],
         [
@@ -134,32 +163,60 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="Логи", callback_data="srv_logs"),
         ],
         [
-            InlineKeyboardButton(text="Перезапуск", callback_data="srv_restart"),
+            InlineKeyboardButton(text="Перезапуск сервера", callback_data="srv_restart"),
         ],
     ])
 
 
-def key_detail_kb(key_id: int, active: bool) -> InlineKeyboardMarkup:
-    toggle_text = "Заблокировать" if active else "Разблокировать"
+def user_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="Конфиг клиента", callback_data=f"key_cfg:{key_id}"),
+            InlineKeyboardButton(text="+ Создать ключ", callback_data="key_create"),
+            InlineKeyboardButton(text="Мои ключи", callback_data="my_keys"),
         ],
         [
-            InlineKeyboardButton(text=toggle_text, callback_data=f"key_toggle:{key_id}"),
-            InlineKeyboardButton(text="Удалить", callback_data=f"key_del:{key_id}"),
-        ],
-        [
-            InlineKeyboardButton(text="<< Назад", callback_data="key_list"),
+            InlineKeyboardButton(text="Статус сервера", callback_data="srv_status"),
         ],
     ])
 
+
+def menu_kb(role: str) -> InlineKeyboardMarkup:
+    return admin_menu_kb() if is_admin(role) else user_menu_kb()
+
+
+def back_menu_btn() -> list[InlineKeyboardButton]:
+    return [InlineKeyboardButton(text="<< Меню", callback_data="main_menu")]
+
+
+def key_detail_kb(key_id: int, active: bool, role: str, is_owner: bool) -> InlineKeyboardMarkup:
+    rows = []
+    rows.append([
+        InlineKeyboardButton(text="Конфиг / URI", callback_data=f"key_cfg:{key_id}"),
+    ])
+    if is_owner or is_admin(role):
+        regen_btn = InlineKeyboardButton(text="Перевыпустить", callback_data=f"key_regen:{key_id}")
+        if is_admin(role):
+            toggle = "Заблокировать" if active else "Разблокировать"
+            rows.append([
+                regen_btn,
+                InlineKeyboardButton(text=toggle, callback_data=f"key_toggle:{key_id}"),
+            ])
+            rows.append([
+                InlineKeyboardButton(text="Удалить", callback_data=f"key_del:{key_id}"),
+            ])
+        else:
+            rows.append([regen_btn])
+    back_cb = "key_list" if is_admin(role) else "my_keys"
+    rows.append([InlineKeyboardButton(text="<< Назад", callback_data=back_cb)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ── Config builders ─────────────────────────────────────────────────────────
 
 def build_client_config(key: str) -> str:
     ip = cfg.get("server_ip", "YOUR_SERVER_IP")
     port = cfg.get("server_port", 443)
     obfs = cfg.get("obfs_password", "")
-
     config_text = (
         f"server: {ip}:{port}\n\n"
         f"auth: {key}\n\n"
@@ -173,6 +230,12 @@ def build_client_config(key: str) -> str:
             f"    password: {obfs}\n\n"
         )
     config_text += (
+        "quic:\n"
+        "  initStreamReceiveWindow: 2097152\n"
+        "  maxStreamReceiveWindow: 4194304\n"
+        "  initConnReceiveWindow: 4194304\n"
+        "  maxConnReceiveWindow: 8388608\n\n"
+        "fastOpen: true\n\n"
         "socks5:\n  listen: 127.0.0.1:1080\n\n"
         "http:\n  listen: 127.0.0.1:8080\n"
     )
@@ -183,7 +246,6 @@ def build_uri(key: str) -> str:
     ip = cfg.get("server_ip", "YOUR_SERVER_IP")
     port = cfg.get("server_port", 443)
     obfs = cfg.get("obfs_password", "")
-
     uri = f"hy2://{key}@{ip}:{port}?"
     if obfs:
         uri += f"obfs=salamander&obfs-password={obfs}&"
@@ -191,92 +253,164 @@ def build_uri(key: str) -> str:
     return uri
 
 
-# ── Handlers ────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+#  HANDLERS
+# ════════════════════════════════════════════════════════════════════════════
+
+# ── /start ──────────────────────────────────────────────────────────────────
 
 @router.message(CommandStart())
 async def cmd_start(msg: Message):
-    if db.is_authed(msg.from_user.id):
+    db_user = db.get_user(msg.from_user.id)
+    if db_user:
+        role_tag = "ADMIN" if is_admin(db_user["role"]) else "USER"
         await msg.answer(
-            "<b>Hysteria 2 VPN Manager</b>\n\nВыберите действие:",
-            reply_markup=main_menu_kb(),
+            f"{HEADER_LINE}\n"
+            f"  <b>Hysteria 2 VPN</b>  [{role_tag}]\n"
+            f"{HEADER_LINE}\n\n"
+            f"Добро пожаловать, <b>{html.escape(get_username(msg.from_user))}</b>",
+            reply_markup=menu_kb(db_user["role"]),
         )
     else:
         await msg.answer(
-            "<b>Hysteria 2 VPN Manager</b>\n\n"
-            "Для доступа введите пароль администратора:"
+            f"{HEADER_LINE}\n"
+            f"  <b>Hysteria 2 VPN</b>\n"
+            f"{HEADER_LINE}\n\n"
+            "Для доступа введите:\n"
+            "  -- <b>Пароль администратора</b> (первый вход)\n"
+            "  -- <b>Инвайт-код</b> (от администратора)"
         )
 
 
-@router.message(Command("menu"))
-async def cmd_menu(msg: Message):
-    await msg.answer("<b>Главное меню</b>", reply_markup=main_menu_kb())
-
-
-@router.message(Command("logout"))
-async def cmd_logout(msg: Message):
-    db.revoke_auth(msg.from_user.id)
-    await msg.answer("Сессия завершена. Введите пароль для повторного входа.")
-
-
-# ── Password handler (non-authed users) ─────────────────────────────────────
+# ── Text input: password / invite code ──────────────────────────────────────
 
 @router.message(F.text)
 async def handle_text(msg: Message):
     if msg.text.startswith("/"):
         return
 
-    if db.is_authed(msg.from_user.id):
-        await msg.answer("Используйте меню:", reply_markup=main_menu_kb())
+    tg_id = msg.from_user.id
+    text = msg.text.strip()
+
+    # Already registered — show menu
+    db_user = db.get_user(tg_id)
+    if db_user:
+        await msg.answer(
+            "Используйте меню:",
+            reply_markup=menu_kb(db_user["role"]),
+        )
         return
 
-    # Try to authenticate
-    if msg.text.strip() == ADMIN_PASSWORD:
-        db.set_authed(msg.from_user.id)
-        await msg.answer(
-            "<b>Авторизация успешна!</b>\n\nВыберите действие:",
-            reply_markup=main_menu_kb(),
-        )
-        # Delete password message for security
+    # Try admin password
+    if text == ADMIN_PASSWORD:
+        existing_admin = db.get_user(tg_id)
+        if not existing_admin:
+            db.create_user(
+                telegram_id=tg_id,
+                username=get_username(msg.from_user),
+                role="admin",
+                max_keys=999,
+                invited_by=0,
+            )
         try:
             await msg.delete()
         except Exception:
             pass
-    else:
-        await msg.answer("Неверный пароль. Попробуйте ещё раз.")
+        await msg.answer(
+            f"{HEADER_LINE}\n"
+            f"  <b>Hysteria 2 VPN</b>  [ADMIN]\n"
+            f"{HEADER_LINE}\n\n"
+            "Вы зарегистрированы как <b>администратор</b>.",
+            reply_markup=admin_menu_kb(),
+        )
+        return
+
+    # Try invite code
+    invite_user = db.use_invite(text, tg_id, get_username(msg.from_user))
+    if invite_user:
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        role_tag = "ADMIN" if is_admin(invite_user["role"]) else "USER"
+        await msg.answer(
+            f"{HEADER_LINE}\n"
+            f"  <b>Hysteria 2 VPN</b>  [{role_tag}]\n"
+            f"{HEADER_LINE}\n\n"
+            f"Инвайт принят! Ваша роль: <b>{invite_user['role']}</b>\n"
+            f"Лимит ключей: <b>{invite_user['max_keys']}</b>",
+            reply_markup=menu_kb(invite_user["role"]),
+        )
+        return
+
+    await msg.answer("Неверный пароль или инвайт-код. Попробуйте снова.")
 
 
-# ── Key management callbacks ────────────────────────────────────────────────
+# ── Main menu ───────────────────────────────────────────────────────────────
 
-@router.callback_query(F.data == "key_create")
-async def cb_key_create(cb: CallbackQuery):
-    key_info = db.create_key(label="", created_by=cb.from_user.id)
-    uri = build_uri(key_info["key"])
-
-    text = (
-        f"<b>Ключ создан!</b>\n\n"
-        f"ID: <code>{key_info['id']}</code>\n"
-        f"Ключ: <code>{key_info['key']}</code>\n"
-        f"Создан: {ts_format(key_info['created_at'])}\n\n"
-        f"<b>URI для мобильного:</b>\n"
-        f"<code>{html.escape(uri)}</code>\n\n"
-        f"Скопируйте URI и вставьте в Hysteria-приложение."
-    )
+@router.callback_query(F.data == "main_menu")
+async def cb_main_menu(cb: CallbackQuery, user_role: str = "user", **kwargs):
+    role_tag = "ADMIN" if is_admin(user_role) else "USER"
     await cb.message.edit_text(
-        text,
-        reply_markup=key_detail_kb(key_info["id"], True),
+        f"{HEADER_LINE}\n"
+        f"  <b>Hysteria 2 VPN</b>  [{role_tag}]\n"
+        f"{HEADER_LINE}\n\n"
+        "Выберите действие:",
+        reply_markup=menu_kb(user_role),
     )
     await cb.answer()
 
 
-@router.callback_query(F.data == "key_list")
-async def cb_key_list(cb: CallbackQuery):
-    keys = db.list_keys()
+# ════════════════════════════════════════════════════════════════════════════
+#  KEY MANAGEMENT
+# ════════════════════════════════════════════════════════════════════════════
+
+@router.callback_query(F.data == "key_create")
+async def cb_key_create(cb: CallbackQuery, user_role: str = "user", db_user: dict = None, **kwargs):
+    tg_id = cb.from_user.id
+    if db_user:
+        max_k = db_user.get("max_keys", 1)
+        current = db.count_user_keys(tg_id)
+        if not is_admin(user_role) and current >= max_k:
+            await cb.answer(
+                f"Лимит ключей: {max_k}. У вас уже {current}.",
+                show_alert=True,
+            )
+            return
+
+    key_info = db.create_key(label="", created_by=tg_id)
+    uri = build_uri(key_info["key"])
+
+    await cb.message.edit_text(
+        f"{HEADER_LINE}\n"
+        f"  <b>Ключ создан</b>\n"
+        f"{HEADER_LINE}\n\n"
+        f"  ID:    <code>{key_info['id']}</code>\n"
+        f"  Ключ:  <code>{key_info['key']}</code>\n"
+        f"  Дата:  {ts_fmt(key_info['created_at'])}\n\n"
+        f"{LINE}\n"
+        f"<b>URI для приложения:</b>\n"
+        f"<code>{html.escape(uri)}</code>\n\n"
+        f"Скопируйте URI и вставьте в Hysteria-приложение.",
+        reply_markup=key_detail_kb(key_info["id"], True, user_role, True),
+    )
+    await cb.answer()
+
+
+# ── My keys (for both roles) ───────────────────────────────────────────────
+
+@router.callback_query(F.data == "my_keys")
+async def cb_my_keys(cb: CallbackQuery, user_role: str = "user", **kwargs):
+    keys = db.list_keys_by_user(cb.from_user.id)
     if not keys:
         await cb.message.edit_text(
-            "<b>Ключей нет.</b>\nСоздайте первый ключ.",
+            f"{HEADER_LINE}\n"
+            f"  <b>Мои ключи</b>\n"
+            f"{HEADER_LINE}\n\n"
+            "У вас пока нет ключей.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="Создать ключ", callback_data="key_create")],
-                [InlineKeyboardButton(text="<< Меню", callback_data="main_menu")],
+                [InlineKeyboardButton(text="+ Создать ключ", callback_data="key_create")],
+                back_menu_btn(),
             ]),
         )
         await cb.answer()
@@ -284,78 +418,213 @@ async def cb_key_list(cb: CallbackQuery):
 
     buttons = []
     for k in keys:
-        status = "[ON]" if k["active"] else "[OFF]"
-        label = k["label"] or f"Key #{k['id']}"
+        st = "ON " if k["active"] else "OFF"
         buttons.append([
             InlineKeyboardButton(
-                text=f"{status} {label} -- {k['key'][:8]}...",
+                text=f"[{st}] #{k['id']} -- {k['key'][:10]}...",
                 callback_data=f"key_view:{k['id']}",
             )
         ])
-    buttons.append([InlineKeyboardButton(text="<< Меню", callback_data="main_menu")])
+    buttons.append(back_menu_btn())
 
-    counts = db.count_keys()
     await cb.message.edit_text(
-        f"<b>Ключи</b> ({counts['active']} активных / {counts['total']} всего)\n\n"
-        "Нажмите на ключ для деталей:",
+        f"{HEADER_LINE}\n"
+        f"  <b>Мои ключи</b>  ({len(keys)} шт.)\n"
+        f"{HEADER_LINE}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
     await cb.answer()
 
 
+# ── All keys (admin only) ──────────────────────────────────────────────────
+
+@router.callback_query(F.data == "key_list")
+async def cb_key_list(cb: CallbackQuery, user_role: str = "user", **kwargs):
+    if not is_admin(user_role):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+
+    keys = db.list_keys()
+    if not keys:
+        await cb.message.edit_text(
+            f"{HEADER_LINE}\n"
+            f"  <b>Все ключи</b>\n"
+            f"{HEADER_LINE}\n\n"
+            "Ключей пока нет.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="+ Создать ключ", callback_data="key_create")],
+                back_menu_btn(),
+            ]),
+        )
+        await cb.answer()
+        return
+
+    buttons = []
+    for k in keys:
+        st = "ON " if k["active"] else "OFF"
+        owner = db.get_user(k["created_by"])
+        owner_name = owner["username"][:8] if owner and owner["username"] else str(k["created_by"])
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"[{st}] #{k['id']} | {owner_name} | {k['key'][:8]}...",
+                callback_data=f"key_view:{k['id']}",
+            )
+        ])
+    buttons.append(back_menu_btn())
+
+    counts = db.count_keys()
+    await cb.message.edit_text(
+        f"{HEADER_LINE}\n"
+        f"  <b>Все ключи</b>\n"
+        f"{HEADER_LINE}\n\n"
+        f"  Активных: {counts['active']}\n"
+        f"  Заблокировано: {counts['blocked']}\n"
+        f"  Всего: {counts['total']}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+    await cb.answer()
+
+
+# ── Key view ────────────────────────────────────────────────────────────────
+
 @router.callback_query(F.data.startswith("key_view:"))
-async def cb_key_view(cb: CallbackQuery):
+async def cb_key_view(cb: CallbackQuery, user_role: str = "user", **kwargs):
     key_id = int(cb.data.split(":")[1])
     k = db.get_key_by_id(key_id)
     if not k:
         await cb.answer("Ключ не найден", show_alert=True)
         return
 
-    status = "Активен" if k["active"] else "Заблокирован"
-    expires = ts_format(k["expires_at"]) if k["expires_at"] > 0 else "Бессрочный"
+    is_owner = k["created_by"] == cb.from_user.id
+    if not is_owner and not is_admin(user_role):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
 
-    text = (
-        f"<b>Ключ #{k['id']}</b>\n\n"
-        f"Статус: {status}\n"
-        f"Ключ: <code>{k['key']}</code>\n"
-        f"Метка: {k['label'] or '—'}\n"
-        f"Создан: {ts_format(k['created_at'])}\n"
-        f"Истекает: {expires}\n"
-    )
+    status = "Активен" if k["active"] else "ЗАБЛОКИРОВАН"
+    expires = ts_fmt(k["expires_at"]) if k["expires_at"] > 0 else "Бессрочный"
+    owner = db.get_user(k["created_by"])
+    owner_name = owner["username"] if owner and owner["username"] else str(k["created_by"])
+
     await cb.message.edit_text(
-        text,
-        reply_markup=key_detail_kb(k["id"], bool(k["active"])),
+        f"{HEADER_LINE}\n"
+        f"  <b>Ключ #{k['id']}</b>\n"
+        f"{HEADER_LINE}\n\n"
+        f"  Статус:     {status}\n"
+        f"  Ключ:       <code>{k['key']}</code>\n"
+        f"  Владелец:   {html.escape(owner_name)}\n"
+        f"  Создан:     {ts_fmt(k['created_at'])}\n"
+        f"  Истекает:   {expires}",
+        reply_markup=key_detail_kb(k["id"], bool(k["active"]), user_role, is_owner),
     )
     await cb.answer()
 
 
+# ── Key config/URI ──────────────────────────────────────────────────────────
+
 @router.callback_query(F.data.startswith("key_cfg:"))
-async def cb_key_config(cb: CallbackQuery):
+async def cb_key_config(cb: CallbackQuery, user_role: str = "user", **kwargs):
     key_id = int(cb.data.split(":")[1])
     k = db.get_key_by_id(key_id)
     if not k:
         await cb.answer("Ключ не найден", show_alert=True)
+        return
+
+    is_owner = k["created_by"] == cb.from_user.id
+    if not is_owner and not is_admin(user_role):
+        await cb.answer("Нет доступа", show_alert=True)
         return
 
     client_cfg = build_client_config(k["key"])
     uri = build_uri(k["key"])
 
-    text = (
-        f"<b>Конфиг для ключа #{k['id']}</b>\n\n"
-        f"<b>config.yaml:</b>\n<pre>{html.escape(client_cfg)}</pre>\n\n"
-        f"<b>URI (для мобильного):</b>\n<code>{html.escape(uri)}</code>"
-    )
     await cb.message.edit_text(
-        text,
+        f"{HEADER_LINE}\n"
+        f"  <b>Конфиг: Ключ #{k['id']}</b>\n"
+        f"{HEADER_LINE}\n\n"
+        f"<b>config.yaml:</b>\n"
+        f"<pre>{html.escape(client_cfg)}</pre>\n"
+        f"{LINE}\n"
+        f"<b>URI:</b>\n"
+        f"<code>{html.escape(uri)}</code>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="<< Назад к ключу", callback_data=f"key_view:{key_id}")],
+            [InlineKeyboardButton(text="<< Назад", callback_data=f"key_view:{key_id}")],
         ]),
     )
     await cb.answer()
 
 
+# ── Key regenerate ──────────────────────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("key_regen:"))
+async def cb_key_regen(cb: CallbackQuery, user_role: str = "user", **kwargs):
+    key_id = int(cb.data.split(":")[1])
+    k = db.get_key_by_id(key_id)
+    if not k:
+        await cb.answer("Ключ не найден", show_alert=True)
+        return
+
+    is_owner = k["created_by"] == cb.from_user.id
+    if not is_owner and not is_admin(user_role):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+
+    await cb.message.edit_text(
+        f"{LINE}\n"
+        f"<b>Перевыпустить ключ #{key_id}?</b>\n\n"
+        f"Старый ключ перестанет работать.\n"
+        f"Будет создан новый.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Да, перевыпустить", callback_data=f"key_regen_yes:{key_id}"),
+                InlineKeyboardButton(text="Отмена", callback_data=f"key_view:{key_id}"),
+            ],
+        ]),
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("key_regen_yes:"))
+async def cb_key_regen_yes(cb: CallbackQuery, user_role: str = "user", **kwargs):
+    key_id = int(cb.data.split(":")[1])
+    k = db.get_key_by_id(key_id)
+    if not k:
+        await cb.answer("Ключ не найден", show_alert=True)
+        return
+
+    is_owner = k["created_by"] == cb.from_user.id
+    if not is_owner and not is_admin(user_role):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+
+    new_key = db.regenerate_key(key_id)
+    if not new_key:
+        await cb.answer("Ошибка перевыпуска", show_alert=True)
+        return
+
+    uri = build_uri(new_key["key"])
+    await cb.message.edit_text(
+        f"{HEADER_LINE}\n"
+        f"  <b>Ключ перевыпущен</b>\n"
+        f"{HEADER_LINE}\n\n"
+        f"  Старый ID: {key_id}  (удалён)\n"
+        f"  Новый ID:  <code>{new_key['id']}</code>\n"
+        f"  Ключ:      <code>{new_key['key']}</code>\n\n"
+        f"{LINE}\n"
+        f"<b>URI:</b>\n"
+        f"<code>{html.escape(uri)}</code>",
+        reply_markup=key_detail_kb(new_key["id"], True, user_role, True),
+    )
+    await cb.answer("Ключ перевыпущен")
+
+
+# ── Key toggle (admin) ─────────────────────────────────────────────────────
+
 @router.callback_query(F.data.startswith("key_toggle:"))
-async def cb_key_toggle(cb: CallbackQuery):
+async def cb_key_toggle(cb: CallbackQuery, user_role: str = "user", **kwargs):
+    if not is_admin(user_role):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+
     key_id = int(cb.data.split(":")[1])
     k = db.toggle_key(key_id)
     if not k:
@@ -365,69 +634,42 @@ async def cb_key_toggle(cb: CallbackQuery):
     status = "разблокирован" if k["active"] else "заблокирован"
     await cb.answer(f"Ключ #{key_id} {status}", show_alert=True)
 
-    # Refresh the key view — build inline text manually to avoid calling handler
-    status_text = "Активен" if k["active"] else "Заблокирован"
-    expires = ts_format(k["expires_at"]) if k["expires_at"] > 0 else "Бессрочный"
-    text = (
-        f"<b>Ключ #{k['id']}</b>\n\n"
-        f"Статус: {status_text}\n"
-        f"Ключ: <code>{k['key']}</code>\n"
-        f"Метка: {k['label'] or '—'}\n"
-        f"Создан: {ts_format(k['created_at'])}\n"
-        f"Истекает: {expires}\n"
-    )
+    # Refresh view
+    status_text = "Активен" if k["active"] else "ЗАБЛОКИРОВАН"
+    expires = ts_fmt(k["expires_at"]) if k["expires_at"] > 0 else "Бессрочный"
+    owner = db.get_user(k["created_by"])
+    owner_name = owner["username"] if owner and owner["username"] else str(k["created_by"])
+    is_owner = k["created_by"] == cb.from_user.id
+
     await cb.message.edit_text(
-        text,
-        reply_markup=key_detail_kb(k["id"], bool(k["active"])),
+        f"{HEADER_LINE}\n"
+        f"  <b>Ключ #{k['id']}</b>\n"
+        f"{HEADER_LINE}\n\n"
+        f"  Статус:     {status_text}\n"
+        f"  Ключ:       <code>{k['key']}</code>\n"
+        f"  Владелец:   {html.escape(owner_name)}\n"
+        f"  Создан:     {ts_fmt(k['created_at'])}\n"
+        f"  Истекает:   {expires}",
+        reply_markup=key_detail_kb(k["id"], bool(k["active"]), user_role, is_owner),
     )
 
 
-@router.callback_query(F.data.startswith("key_del_confirm:"))
-async def cb_key_del_confirm(cb: CallbackQuery):
-    key_id = int(cb.data.split(":")[1])
-    success = db.delete_key(key_id)
-    if success:
-        await cb.answer(f"Ключ #{key_id} удалён", show_alert=True)
-        # Show key list
-        keys = db.list_keys()
-        if not keys:
-            await cb.message.edit_text(
-                "<b>Ключей нет.</b>\nСоздайте первый ключ.",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="Создать ключ", callback_data="key_create")],
-                    [InlineKeyboardButton(text="<< Меню", callback_data="main_menu")],
-                ]),
-            )
-        else:
-            buttons = []
-            for k in keys:
-                st = "[ON]" if k["active"] else "[OFF]"
-                label = k["label"] or f"Key #{k['id']}"
-                buttons.append([
-                    InlineKeyboardButton(
-                        text=f"{st} {label} -- {k['key'][:8]}...",
-                        callback_data=f"key_view:{k['id']}",
-                    )
-                ])
-            buttons.append([InlineKeyboardButton(text="<< Меню", callback_data="main_menu")])
-            counts = db.count_keys()
-            await cb.message.edit_text(
-                f"<b>Ключи</b> ({counts['active']} активных / {counts['total']} всего)\n\n"
-                "Нажмите на ключ для деталей:",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-            )
-    else:
-        await cb.answer("Ключ не найден", show_alert=True)
-
+# ── Key delete (admin) ─────────────────────────────────────────────────────
 
 @router.callback_query(F.data.startswith("key_del:"))
-async def cb_key_del(cb: CallbackQuery):
+async def cb_key_del(cb: CallbackQuery, user_role: str = "user", **kwargs):
+    if not is_admin(user_role):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+
     key_id = int(cb.data.split(":")[1])
     await cb.message.edit_text(
-        f"<b>Удалить ключ #{key_id}?</b>\n\nЭто действие необратимо.",
+        f"{LINE}\n"
+        f"<b>Удалить ключ #{key_id}?</b>\n\n"
+        f"Это действие необратимо.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [
-                InlineKeyboardButton(text="Да, удалить", callback_data=f"key_del_confirm:{key_id}"),
+                InlineKeyboardButton(text="Да, удалить", callback_data=f"key_del_yes:{key_id}"),
                 InlineKeyboardButton(text="Отмена", callback_data=f"key_view:{key_id}"),
             ],
         ]),
@@ -435,39 +677,387 @@ async def cb_key_del(cb: CallbackQuery):
     await cb.answer()
 
 
-# ── Server management callbacks ─────────────────────────────────────────────
+@router.callback_query(F.data.startswith("key_del_yes:"))
+async def cb_key_del_yes(cb: CallbackQuery, user_role: str = "user", **kwargs):
+    if not is_admin(user_role):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+
+    key_id = int(cb.data.split(":")[1])
+    db.delete_key(key_id)
+    await cb.answer(f"Ключ #{key_id} удалён", show_alert=True)
+
+    # Return to all keys
+    keys = db.list_keys()
+    if not keys:
+        await cb.message.edit_text(
+            f"{HEADER_LINE}\n  <b>Все ключи</b>\n{HEADER_LINE}\n\nКлючей нет.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="+ Создать ключ", callback_data="key_create")],
+                back_menu_btn(),
+            ]),
+        )
+    else:
+        buttons = []
+        for k in keys:
+            st = "ON " if k["active"] else "OFF"
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"[{st}] #{k['id']} | {k['key'][:8]}...",
+                    callback_data=f"key_view:{k['id']}",
+                )
+            ])
+        buttons.append(back_menu_btn())
+        counts = db.count_keys()
+        await cb.message.edit_text(
+            f"{HEADER_LINE}\n  <b>Все ключи</b>\n{HEADER_LINE}\n\n"
+            f"  Активных: {counts['active']}  |  Всего: {counts['total']}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  INVITE CODES (admin only)
+# ════════════════════════════════════════════════════════════════════════════
+
+@router.callback_query(F.data == "invite_create")
+async def cb_invite_create(cb: CallbackQuery, user_role: str = "user", **kwargs):
+    if not is_admin(user_role):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+
+    await cb.message.edit_text(
+        f"{HEADER_LINE}\n"
+        f"  <b>Создать инвайт</b>\n"
+        f"{HEADER_LINE}\n\n"
+        "Выберите роль для приглашённого:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="User (1 ключ)", callback_data="invite_mk:user:1"),
+                InlineKeyboardButton(text="User (3 ключа)", callback_data="invite_mk:user:3"),
+            ],
+            [
+                InlineKeyboardButton(text="User (5 ключей)", callback_data="invite_mk:user:5"),
+                InlineKeyboardButton(text="Admin", callback_data="invite_mk:admin:999"),
+            ],
+            back_menu_btn(),
+        ]),
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("invite_mk:"))
+async def cb_invite_mk(cb: CallbackQuery, user_role: str = "user", **kwargs):
+    if not is_admin(user_role):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+
+    parts = cb.data.split(":")
+    role = parts[1]
+    max_keys = int(parts[2])
+
+    invite = db.create_invite(role=role, max_keys=max_keys, created_by=cb.from_user.id)
+    role_tag = "ADMIN" if role == "admin" else "USER"
+
+    await cb.message.edit_text(
+        f"{HEADER_LINE}\n"
+        f"  <b>Инвайт создан</b>  [{role_tag}]\n"
+        f"{HEADER_LINE}\n\n"
+        f"  Код:      <code>{invite['code']}</code>\n"
+        f"  Роль:     {role}\n"
+        f"  Ключей:   {max_keys}\n\n"
+        f"Отправьте этот код пользователю.\n"
+        f"Код одноразовый.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="+ Ещё инвайт", callback_data="invite_create")],
+            [InlineKeyboardButton(text="Список инвайтов", callback_data="invite_list")],
+            back_menu_btn(),
+        ]),
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data == "invite_list")
+async def cb_invite_list(cb: CallbackQuery, user_role: str = "user", **kwargs):
+    if not is_admin(user_role):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+
+    invites = db.list_invites()
+    if not invites:
+        await cb.message.edit_text(
+            f"{HEADER_LINE}\n  <b>Инвайт-коды</b>\n{HEADER_LINE}\n\n"
+            "Нет инвайтов.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="+ Создать", callback_data="invite_create")],
+                back_menu_btn(),
+            ]),
+        )
+        await cb.answer()
+        return
+
+    lines = []
+    buttons = []
+    for inv in invites:
+        used = "ИСПОЛЬЗОВАН" if inv["used_by"] else "СВОБОДЕН"
+        role_tag = "A" if inv["role"] == "admin" else "U"
+        lines.append(
+            f"  <code>{inv['code']}</code>  [{role_tag}]  {used}"
+        )
+        if not inv["used_by"]:
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"Удалить: {inv['code']}",
+                    callback_data=f"invite_del:{inv['code']}",
+                )
+            ])
+
+    buttons.append([InlineKeyboardButton(text="+ Создать", callback_data="invite_create")])
+    buttons.append(back_menu_btn())
+
+    await cb.message.edit_text(
+        f"{HEADER_LINE}\n  <b>Инвайт-коды</b>\n{HEADER_LINE}\n\n"
+        + "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("invite_del:"))
+async def cb_invite_del(cb: CallbackQuery, user_role: str = "user", **kwargs):
+    if not is_admin(user_role):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+
+    code = cb.data.split(":", 1)[1]
+    db.delete_invite(code)
+    await cb.answer(f"Инвайт {code} удалён", show_alert=True)
+
+    # Refresh list by re-triggering
+    cb.data = "invite_list"
+    await cb_invite_list(cb, user_role=user_role)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  USER MANAGEMENT (admin only)
+# ════════════════════════════════════════════════════════════════════════════
+
+@router.callback_query(F.data == "user_list")
+async def cb_user_list(cb: CallbackQuery, user_role: str = "user", **kwargs):
+    if not is_admin(user_role):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+
+    users = db.list_users()
+    counts = db.count_users()
+
+    buttons = []
+    for u in users:
+        role_tag = "A" if u["role"] == "admin" else "U"
+        name = u["username"] or str(u["telegram_id"])
+        key_count = db.count_user_keys(u["telegram_id"])
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"[{role_tag}] {name}  |  {key_count} ключей",
+                callback_data=f"user_view:{u['telegram_id']}",
+            )
+        ])
+    buttons.append(back_menu_btn())
+
+    await cb.message.edit_text(
+        f"{HEADER_LINE}\n  <b>Пользователи</b>\n{HEADER_LINE}\n\n"
+        f"  Админов: {counts['admins']}  |  Юзеров: {counts['users']}  |  Всего: {counts['total']}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("user_view:"))
+async def cb_user_view(cb: CallbackQuery, user_role: str = "user", **kwargs):
+    if not is_admin(user_role):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+
+    tg_id = int(cb.data.split(":")[1])
+    u = db.get_user(tg_id)
+    if not u:
+        await cb.answer("Пользователь не найден", show_alert=True)
+        return
+
+    key_count = db.count_user_keys(tg_id)
+    role_tag = "ADMIN" if u["role"] == "admin" else "USER"
+    name = u["username"] or str(u["telegram_id"])
+
+    toggle_role = "user" if u["role"] == "admin" else "admin"
+    toggle_text = "Понизить до User" if u["role"] == "admin" else "Повысить до Admin"
+
+    rows = [
+        [InlineKeyboardButton(text=f"Ключи ({key_count})", callback_data=f"user_keys:{tg_id}")],
+        [InlineKeyboardButton(text=toggle_text, callback_data=f"user_role:{tg_id}:{toggle_role}")],
+        [InlineKeyboardButton(text="Удалить пользователя", callback_data=f"user_del:{tg_id}")],
+        [InlineKeyboardButton(text="<< Назад", callback_data="user_list")],
+    ]
+
+    await cb.message.edit_text(
+        f"{HEADER_LINE}\n"
+        f"  <b>Пользователь</b>  [{role_tag}]\n"
+        f"{HEADER_LINE}\n\n"
+        f"  Имя:       {html.escape(name)}\n"
+        f"  TG ID:     <code>{tg_id}</code>\n"
+        f"  Роль:      {u['role']}\n"
+        f"  Ключей:    {key_count} / {u['max_keys']}\n"
+        f"  Дата рег:  {ts_fmt(u['created_at'])}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("user_keys:"))
+async def cb_user_keys(cb: CallbackQuery, user_role: str = "user", **kwargs):
+    if not is_admin(user_role):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+
+    tg_id = int(cb.data.split(":")[1])
+    keys = db.list_keys_by_user(tg_id)
+
+    if not keys:
+        await cb.message.edit_text(
+            f"{LINE}\nУ пользователя нет ключей.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="<< Назад", callback_data=f"user_view:{tg_id}")],
+            ]),
+        )
+        await cb.answer()
+        return
+
+    buttons = []
+    for k in keys:
+        st = "ON " if k["active"] else "OFF"
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"[{st}] #{k['id']} -- {k['key'][:10]}...",
+                callback_data=f"key_view:{k['id']}",
+            )
+        ])
+    buttons.append([InlineKeyboardButton(text="<< Назад", callback_data=f"user_view:{tg_id}")])
+
+    await cb.message.edit_text(
+        f"{HEADER_LINE}\n  <b>Ключи пользователя</b>\n{HEADER_LINE}\n\n"
+        f"  Всего: {len(keys)}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("user_role:"))
+async def cb_user_role(cb: CallbackQuery, user_role: str = "user", **kwargs):
+    if not is_admin(user_role):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+
+    parts = cb.data.split(":")
+    tg_id = int(parts[1])
+    new_role = parts[2]
+
+    if tg_id == cb.from_user.id:
+        await cb.answer("Нельзя изменить свою роль", show_alert=True)
+        return
+
+    db.update_user_role(tg_id, new_role)
+    await cb.answer(f"Роль изменена на {new_role}", show_alert=True)
+
+    # Refresh
+    cb.data = f"user_view:{tg_id}"
+    await cb_user_view(cb, user_role=user_role)
+
+
+@router.callback_query(F.data.startswith("user_del:"))
+async def cb_user_del(cb: CallbackQuery, user_role: str = "user", **kwargs):
+    if not is_admin(user_role):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+
+    tg_id = int(cb.data.split(":")[1])
+
+    if tg_id == cb.from_user.id:
+        await cb.answer("Нельзя удалить себя", show_alert=True)
+        return
+
+    u = db.get_user(tg_id)
+    name = u["username"] if u else str(tg_id)
+
+    await cb.message.edit_text(
+        f"{LINE}\n"
+        f"<b>Удалить пользователя {html.escape(name)}?</b>\n\n"
+        f"Все его ключи тоже будут удалены.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Да, удалить", callback_data=f"user_del_yes:{tg_id}"),
+                InlineKeyboardButton(text="Отмена", callback_data=f"user_view:{tg_id}"),
+            ],
+        ]),
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("user_del_yes:"))
+async def cb_user_del_yes(cb: CallbackQuery, user_role: str = "user", **kwargs):
+    if not is_admin(user_role):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+
+    tg_id = int(cb.data.split(":")[1])
+    if tg_id == cb.from_user.id:
+        await cb.answer("Нельзя удалить себя", show_alert=True)
+        return
+
+    db.delete_user(tg_id)
+    await cb.answer("Пользователь удалён", show_alert=True)
+
+    cb.data = "user_list"
+    await cb_user_list(cb, user_role=user_role)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  SERVER MANAGEMENT
+# ════════════════════════════════════════════════════════════════════════════
 
 @router.callback_query(F.data == "srv_status")
-async def cb_srv_status(cb: CallbackQuery):
+async def cb_srv_status(cb: CallbackQuery, user_role: str = "user", **kwargs):
     try:
         result = subprocess.run(
             ["systemctl", "status", cfg["hysteria_service"]],
             capture_output=True, text=True, timeout=10,
         )
         status_text = result.stdout or result.stderr or "Нет данных"
-        if len(status_text) > 3500:
-            status_text = status_text[:3500] + "\n..."
+        if len(status_text) > 3000:
+            status_text = status_text[:3000] + "\n..."
     except Exception as e:
         status_text = f"Ошибка: {e}"
 
     counts = db.count_keys()
+    user_counts = db.count_users()
 
-    text = (
-        f"<b>Статус сервера</b>\n\n"
-        f"Ключи: {counts['active']} активных / {counts['total']} всего\n\n"
-        f"<pre>{html.escape(status_text)}</pre>"
-    )
     await cb.message.edit_text(
-        text,
+        f"{HEADER_LINE}\n  <b>Статус сервера</b>\n{HEADER_LINE}\n\n"
+        f"  Ключи:          {counts['active']} активных / {counts['total']} всего\n"
+        f"  Пользователи:   {user_counts['total']}\n\n"
+        f"<pre>{html.escape(status_text)}</pre>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="<< Меню", callback_data="main_menu")],
+            [InlineKeyboardButton(text="Обновить", callback_data="srv_status")],
+            back_menu_btn(),
         ]),
     )
     await cb.answer()
 
 
 @router.callback_query(F.data == "srv_stats")
-async def cb_srv_stats(cb: CallbackQuery):
+async def cb_srv_stats(cb: CallbackQuery, user_role: str = "user", **kwargs):
+    if not is_admin(user_role):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+
     stats_listen = cfg.get("stats_listen", "127.0.0.1:9090")
     secret = cfg.get("stats_secret", "")
 
@@ -480,30 +1070,37 @@ async def cb_srv_stats(cb: CallbackQuery):
                 data = await resp.json()
 
         if not data:
-            text = "<b>Трафик</b>\n\nНет данных о трафике."
+            text = f"{HEADER_LINE}\n  <b>Трафик</b>\n{HEADER_LINE}\n\nНет данных."
         else:
             lines = []
             for user_key, traffic in data.items():
                 short_key = user_key[:12] + "..."
                 tx = human_bytes(traffic.get("tx", 0))
                 rx = human_bytes(traffic.get("rx", 0))
-                lines.append(f"<code>{short_key}</code>  UP:{tx}  DN:{rx}")
-            text = f"<b>Трафик ({len(data)} сессий)</b>\n\n" + "\n".join(lines)
+                lines.append(f"  <code>{short_key}</code>  UP {tx}  DN {rx}")
+            text = (
+                f"{HEADER_LINE}\n  <b>Трафик</b>  ({len(data)} сессий)\n{HEADER_LINE}\n\n"
+                + "\n".join(lines)
+            )
     except Exception as e:
-        text = f"<b>Трафик</b>\n\nНе удалось получить данные: {e}"
+        text = f"{HEADER_LINE}\n  <b>Трафик</b>\n{HEADER_LINE}\n\nОшибка: {e}"
 
     await cb.message.edit_text(
         text,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Обновить", callback_data="srv_stats")],
-            [InlineKeyboardButton(text="<< Меню", callback_data="main_menu")],
+            back_menu_btn(),
         ]),
     )
     await cb.answer()
 
 
 @router.callback_query(F.data == "srv_online")
-async def cb_srv_online(cb: CallbackQuery):
+async def cb_srv_online(cb: CallbackQuery, user_role: str = "user", **kwargs):
+    if not is_admin(user_role):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+
     stats_listen = cfg.get("stats_listen", "127.0.0.1:9090")
     secret = cfg.get("stats_secret", "")
 
@@ -516,32 +1113,36 @@ async def cb_srv_online(cb: CallbackQuery):
                 data = await resp.json()
 
         if not data:
-            text = "<b>Онлайн</b>\n\nНикто не подключён."
+            text = f"{HEADER_LINE}\n  <b>Онлайн</b>\n{HEADER_LINE}\n\nНикто не подключён."
         else:
-            total_online = sum(data.values()) if isinstance(data, dict) else 0
+            total = sum(data.values()) if isinstance(data, dict) else 0
             lines = []
             for user_key, count in data.items():
                 short_key = user_key[:12] + "..."
-                lines.append(f"<code>{short_key}</code>  -- {count} устр.")
+                lines.append(f"  <code>{short_key}</code>  -- {count} устр.")
             text = (
-                f"<b>Онлайн: {total_online} подключений</b>\n\n"
+                f"{HEADER_LINE}\n  <b>Онлайн: {total}</b>\n{HEADER_LINE}\n\n"
                 + "\n".join(lines)
             )
     except Exception as e:
-        text = f"<b>Онлайн</b>\n\nНе удалось получить данные: {e}"
+        text = f"{HEADER_LINE}\n  <b>Онлайн</b>\n{HEADER_LINE}\n\nОшибка: {e}"
 
     await cb.message.edit_text(
         text,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Обновить", callback_data="srv_online")],
-            [InlineKeyboardButton(text="<< Меню", callback_data="main_menu")],
+            back_menu_btn(),
         ]),
     )
     await cb.answer()
 
 
 @router.callback_query(F.data == "srv_logs")
-async def cb_srv_logs(cb: CallbackQuery):
+async def cb_srv_logs(cb: CallbackQuery, user_role: str = "user", **kwargs):
+    if not is_admin(user_role):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+
     try:
         result = subprocess.run(
             ["journalctl", "-u", cfg["hysteria_service"], "--no-pager",
@@ -549,29 +1150,33 @@ async def cb_srv_logs(cb: CallbackQuery):
             capture_output=True, text=True, timeout=10,
         )
         logs = result.stdout or "Нет логов."
-        if len(logs) > 3800:
-            logs = logs[-3800:]
+        if len(logs) > 3500:
+            logs = logs[-3500:]
     except Exception as e:
         logs = f"Ошибка: {e}"
 
     await cb.message.edit_text(
-        f"<b>Логи</b> (последние {cfg.get('log_lines', 50)} строк)\n\n"
+        f"{HEADER_LINE}\n  <b>Логи</b>\n{HEADER_LINE}\n\n"
         f"<pre>{html.escape(logs)}</pre>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Обновить", callback_data="srv_logs")],
-            [InlineKeyboardButton(text="<< Меню", callback_data="main_menu")],
+            back_menu_btn(),
         ]),
     )
     await cb.answer()
 
 
 @router.callback_query(F.data == "srv_restart")
-async def cb_srv_restart(cb: CallbackQuery):
+async def cb_srv_restart(cb: CallbackQuery, user_role: str = "user", **kwargs):
+    if not is_admin(user_role):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+
     await cb.message.edit_text(
-        "<b>Перезапустить Hysteria?</b>",
+        f"{LINE}\n<b>Перезапустить Hysteria?</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [
-                InlineKeyboardButton(text="Да", callback_data="srv_restart_confirm"),
+                InlineKeyboardButton(text="Да", callback_data="srv_restart_yes"),
                 InlineKeyboardButton(text="Отмена", callback_data="main_menu"),
             ],
         ]),
@@ -579,46 +1184,35 @@ async def cb_srv_restart(cb: CallbackQuery):
     await cb.answer()
 
 
-@router.callback_query(F.data == "srv_restart_confirm")
-async def cb_srv_restart_confirm(cb: CallbackQuery):
+@router.callback_query(F.data == "srv_restart_yes")
+async def cb_srv_restart_yes(cb: CallbackQuery, user_role: str = "user", **kwargs):
+    if not is_admin(user_role):
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+
     try:
         subprocess.run(
             ["systemctl", "restart", cfg["hysteria_service"]],
             timeout=15, check=True,
         )
         await cb.message.edit_text(
-            "<b>Сервис перезапущен.</b>",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="<< Меню", callback_data="main_menu")],
-            ]),
+            f"{LINE}\n<b>Сервис перезапущен.</b>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[back_menu_btn()]),
         )
     except Exception as e:
         await cb.message.edit_text(
-            f"<b>Ошибка перезапуска:</b> {e}",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="<< Меню", callback_data="main_menu")],
-            ]),
+            f"{LINE}\n<b>Ошибка:</b> {e}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[back_menu_btn()]),
         )
-    await cb.answer()
-
-
-@router.callback_query(F.data == "main_menu")
-async def cb_main_menu(cb: CallbackQuery):
-    await cb.message.edit_text(
-        "<b>Главное меню</b>\n\nВыберите действие:",
-        reply_markup=main_menu_kb(),
-    )
     await cb.answer()
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
 
 async def main():
-    # Start auth backend
     log.info(f"Starting auth backend on 127.0.0.1:{cfg.get('auth_backend_port', 8787)}")
     await auth_backend.start()
 
-    # Start bot polling
     log.info("Starting Telegram bot...")
     try:
         await dp.start_polling(bot, drop_pending_updates=True)

@@ -193,17 +193,18 @@ obfs:
   salamander:
     password: ${OBFS_PASSWORD}
 
-# QUIC performance tuning
+# QUIC tuning — optimized for low latency
 quic:
-  initStreamReceiveWindow: 16777216
-  maxStreamReceiveWindow: 16777216
-  initConnReceiveWindow: 33554432
-  maxConnReceiveWindow: 33554432
-  maxIdleTimeout: 90s
-  maxIncomingStreams: 2048
+  initStreamReceiveWindow: 2097152
+  maxStreamReceiveWindow: 4194304
+  initConnReceiveWindow: 4194304
+  maxConnReceiveWindow: 8388608
+  maxIdleTimeout: 30s
+  maxIncomingStreams: 1024
   disablePathMTUDiscovery: false
 
-ignoreClientBandwidth: false
+# Let server decide bandwidth — avoids Brutal without client bandwidth set
+ignoreClientBandwidth: true
 
 # Traffic Stats API
 trafficStats:
@@ -295,21 +296,64 @@ setup_firewall() {
         netfilter-persistent save 2>/dev/null || true
     fi
 
-    # Optimize network buffers for QUIC
-    sysctl -w net.core.rmem_max=16777216 > /dev/null 2>&1
-    sysctl -w net.core.wmem_max=16777216 > /dev/null 2>&1
-    sysctl -w net.core.rmem_default=1048576 > /dev/null 2>&1
-    sysctl -w net.core.wmem_default=1048576 > /dev/null 2>&1
+    # ── Kernel-level network optimizations for QUIC/UDP ──
 
-    for param in "net.core.rmem_max=16777216" "net.core.wmem_max=16777216" \
-                 "net.core.rmem_default=1048576" "net.core.wmem_default=1048576"; do
-        local key="${param%%=*}"
-        if ! grep -q "^${key}" /etc/sysctl.conf 2>/dev/null; then
-            echo "${param}" >> /etc/sysctl.conf
-        fi
-    done
+    # Enable BBR congestion control (reduces bufferbloat, lowers latency)
+    modprobe tcp_bbr 2>/dev/null || true
 
-    info "Firewall and network optimizations applied."
+    # Create optimized sysctl config
+    cat > /etc/sysctl.d/99-hysteria.conf <<'SYSCTL'
+# === Hysteria 2 QUIC/UDP Optimizations ===
+
+# BBR congestion control — critical for low latency
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+
+# UDP/QUIC buffer sizes (moderate — avoids bufferbloat)
+net.core.rmem_max = 8388608
+net.core.wmem_max = 8388608
+net.core.rmem_default = 524288
+net.core.wmem_default = 524288
+
+# TCP buffer auto-tuning (also helps QUIC stack)
+net.ipv4.tcp_rmem = 4096 524288 8388608
+net.ipv4.tcp_wmem = 4096 524288 8388608
+
+# Increase network backlog for high throughput
+net.core.netdev_max_backlog = 4096
+net.core.somaxconn = 4096
+
+# Conntrack optimization — prevent drops under load
+net.netfilter.nf_conntrack_max = 131072
+net.netfilter.nf_conntrack_udp_timeout = 60
+net.netfilter.nf_conntrack_udp_timeout_stream = 120
+
+# IP forwarding
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+
+# Reduce TIME_WAIT sockets
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_tw_reuse = 1
+
+# Faster keepalive for dead connection cleanup
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_intvl = 15
+net.ipv4.tcp_keepalive_probes = 5
+
+# Disable slow start after idle — keeps connections fast
+net.ipv4.tcp_slow_start_after_idle = 0
+
+# Enable MTU probing — helps on paths with non-standard MTU
+net.ipv4.tcp_mtu_probing = 1
+
+# Increase file descriptors
+fs.file-max = 1048576
+SYSCTL
+
+    sysctl --system > /dev/null 2>&1
+
+    info "Firewall and kernel optimizations applied (BBR, UDP buffers, conntrack)."
 }
 
 # ── Systemd: Hysteria service ─────────────────────────────────────────────
