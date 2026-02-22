@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # ============================================================================
 #  Hysteria 2 VPN Server — One-Click Deploy Script for Ubuntu 24.04
-#  Features: Self-signed TLS, Salamander obfuscation, PSK auth,
-#            systemd service, traffic stats API, auto-update cron,
-#            management commands (status/restart/uninstall/change-key/etc.)
+#  Features: Self-signed TLS, Salamander obfuscation, HTTP auth backend,
+#            multi-key via Telegram bot, systemd services, traffic stats API,
+#            auto-update cron, management commands
 # ============================================================================
 set -euo pipefail
 
@@ -25,14 +25,20 @@ CERT_FILE="${CERT_DIR}/server.crt"
 KEY_FILE="${CERT_DIR}/server.key"
 SERVICE_NAME="hysteria-server"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+BOT_DIR="${HYSTERIA_DIR}/bot"
+BOT_SERVICE_NAME="hysteria-bot"
+BOT_SERVICE_FILE="/etc/systemd/system/${BOT_SERVICE_NAME}.service"
+BOT_CONFIG_FILE="${BOT_DIR}/bot.json"
 CRON_SCRIPT="/etc/cron.daily/hysteria-update"
 MANAGEMENT_SCRIPT="/usr/local/bin/hysteria-manage"
 LISTEN_PORT=443
 STATS_PORT=9090
+AUTH_BACKEND_PORT=8787
 STATS_SECRET=""
-PSK=""
 OBFS_PASSWORD=""
-MASQ_URL="https://www.google.com"  # fallback, not used with Salamander
+BOT_TOKEN=""
+ADMIN_PASSWORD=""
+SERVER_IP=""
 
 # ── Pre-flight checks ──────────────────────────────────────────────────────
 preflight() {
@@ -40,7 +46,6 @@ preflight() {
         fatal "This script must be run as root."
     fi
 
-    # Check Ubuntu 24.04
     if [[ -f /etc/os-release ]]; then
         . /etc/os-release
         if [[ "${ID}" != "ubuntu" ]]; then
@@ -56,12 +61,36 @@ preflight() {
     info "Pre-flight checks passed."
 }
 
+# ── Ask for Telegram bot config ────────────────────────────────────────────
+ask_bot_config() {
+    echo ""
+    echo -e "${BOLD}── Telegram Bot Configuration ──${NC}"
+    echo ""
+
+    while [[ -z "${BOT_TOKEN}" ]]; do
+        read -rp "$(echo -e "${CYAN}Telegram Bot Token${NC} (from @BotFather): ")" BOT_TOKEN
+        if [[ -z "${BOT_TOKEN}" ]]; then
+            err "Bot token cannot be empty."
+        fi
+    done
+
+    while [[ -z "${ADMIN_PASSWORD}" ]]; do
+        read -rp "$(echo -e "${CYAN}Admin password${NC} (for bot access): ")" ADMIN_PASSWORD
+        if [[ -z "${ADMIN_PASSWORD}" ]]; then
+            err "Admin password cannot be empty."
+        fi
+    done
+
+    info "Bot configuration received."
+}
+
 # ── Install dependencies ───────────────────────────────────────────────────
 install_deps() {
     info "Updating package lists and installing dependencies..."
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
-    apt-get install -y -qq curl wget openssl iptables jq cron > /dev/null 2>&1
+    apt-get install -y -qq curl wget openssl iptables jq cron \
+        python3 python3-pip python3-venv > /dev/null 2>&1
     info "Dependencies installed."
 }
 
@@ -76,7 +105,6 @@ install_hysteria() {
 
     info "Downloading Hysteria 2 via official installer..."
     bash <(curl -fsSL https://get.hy2.sh/) > /dev/null 2>&1 || {
-        # Fallback: direct download
         warn "Official installer failed. Trying direct download..."
         local ARCH
         ARCH=$(uname -m)
@@ -91,9 +119,7 @@ install_hysteria() {
         chmod +x "${HYSTERIA_BIN}"
     }
 
-    # Verify binary
     if [[ ! -x "${HYSTERIA_BIN}" ]]; then
-        # The official installer might place the binary elsewhere
         local alt_bin
         alt_bin=$(which hysteria 2>/dev/null || true)
         if [[ -n "${alt_bin}" && -x "${alt_bin}" ]]; then
@@ -108,10 +134,15 @@ install_hysteria() {
 
 # ── Generate secrets ───────────────────────────────────────────────────────
 generate_secrets() {
-    PSK=$(openssl rand -hex 16)
     OBFS_PASSWORD=$(openssl rand -hex 16)
     STATS_SECRET=$(openssl rand -hex 16)
-    info "Generated PSK auth key, obfuscation password, and stats secret."
+    info "Generated obfuscation password and stats secret."
+}
+
+# ── Detect server IP ──────────────────────────────────────────────────────
+detect_server_ip() {
+    SERVER_IP=$(curl -4 -fsSL ifconfig.me 2>/dev/null || curl -4 -fsSL icanhazip.com 2>/dev/null || echo "127.0.0.1")
+    info "Server IP detected: ${SERVER_IP}"
 }
 
 # ── Generate self-signed certificate ───────────────────────────────────────
@@ -123,8 +154,6 @@ generate_cert() {
     fi
 
     info "Generating self-signed TLS certificate (10 years)..."
-    local SERVER_IP
-    SERVER_IP=$(curl -4 -fsSL ifconfig.me 2>/dev/null || curl -4 -fsSL icanhazip.com 2>/dev/null || echo "127.0.0.1")
 
     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
         -days 3650 -nodes \
@@ -139,13 +168,13 @@ generate_cert() {
     info "Certificate generated for IP: ${SERVER_IP}"
 }
 
-# ── Write Hysteria config ──────────────────────────────────────────────────
+# ── Write Hysteria config (HTTP auth backend) ─────────────────────────────
 write_config() {
     mkdir -p "${HYSTERIA_DIR}"
 
     cat > "${CONFIG_FILE}" <<YAML
 # Hysteria 2 Server Configuration
-# Auto-generated by deploy.sh
+# Auth via HTTP backend (Telegram bot manages keys)
 
 listen: :${LISTEN_PORT}
 
@@ -154,8 +183,10 @@ tls:
   key: ${KEY_FILE}
 
 auth:
-  type: password
-  password: ${PSK}
+  type: http
+  http:
+    url: http://127.0.0.1:${AUTH_BACKEND_PORT}/auth
+    insecure: false
 
 obfs:
   type: salamander
@@ -172,10 +203,6 @@ quic:
   maxIncomingStreams: 2048
   disablePathMTUDiscovery: false
 
-# No bandwidth limits — unlimited speed
-# bandwidth:
-#   up: 0
-#   down: 0
 ignoreClientBandwidth: false
 
 # Traffic Stats API
@@ -183,7 +210,7 @@ trafficStats:
   listen: 127.0.0.1:${STATS_PORT}
   secret: ${STATS_SECRET}
 
-# Outbound — direct with BBR-like behavior
+# Outbound — direct
 outbounds:
   - name: default
     type: direct
@@ -195,15 +222,59 @@ YAML
     info "Configuration written to ${CONFIG_FILE}"
 }
 
+# ── Install Telegram bot ──────────────────────────────────────────────────
+install_bot() {
+    info "Installing Telegram bot..."
+
+    mkdir -p "${BOT_DIR}"
+
+    # Copy bot source files
+    local SCRIPT_DIR
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+    if [[ -d "${SCRIPT_DIR}/bot" ]]; then
+        cp "${SCRIPT_DIR}/bot/"*.py "${BOT_DIR}/"
+        cp "${SCRIPT_DIR}/bot/requirements.txt" "${BOT_DIR}/"
+        info "Bot files copied from ${SCRIPT_DIR}/bot/"
+    else
+        fatal "Bot source directory not found at ${SCRIPT_DIR}/bot/. Ensure bot/ folder is alongside deploy.sh"
+    fi
+
+    # Create Python virtual environment
+    info "Setting up Python virtual environment..."
+    python3 -m venv "${BOT_DIR}/venv"
+    "${BOT_DIR}/venv/bin/pip" install --upgrade pip > /dev/null 2>&1
+    "${BOT_DIR}/venv/bin/pip" install -r "${BOT_DIR}/requirements.txt" > /dev/null 2>&1
+    info "Python dependencies installed."
+
+    # Write bot config
+    cat > "${BOT_CONFIG_FILE}" <<BOTJSON
+{
+  "bot_token": "${BOT_TOKEN}",
+  "admin_password": "${ADMIN_PASSWORD}",
+  "auth_backend_port": ${AUTH_BACKEND_PORT},
+  "hysteria_config": "${CONFIG_FILE}",
+  "hysteria_service": "${SERVICE_NAME}",
+  "stats_listen": "127.0.0.1:${STATS_PORT}",
+  "stats_secret": "${STATS_SECRET}",
+  "server_ip": "${SERVER_IP}",
+  "server_port": ${LISTEN_PORT},
+  "obfs_password": "${OBFS_PASSWORD}",
+  "log_lines": 50
+}
+BOTJSON
+
+    chmod 600 "${BOT_CONFIG_FILE}"
+    info "Bot configuration saved to ${BOT_CONFIG_FILE}"
+}
+
 # ── Firewall rules ─────────────────────────────────────────────────────────
 setup_firewall() {
     info "Configuring firewall rules..."
 
-    # Enable IP forwarding
     sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1
     sysctl -w net.ipv6.conf.all.forwarding=1 > /dev/null 2>&1
 
-    # Persist IP forwarding
     if ! grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null; then
         echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
     fi
@@ -211,19 +282,15 @@ setup_firewall() {
         echo "net.ipv6.conf.all.forwarding=1" >> /etc/sysctl.conf
     fi
 
-    # Allow Hysteria port (UDP)
     iptables -C INPUT -p udp --dport "${LISTEN_PORT}" -j ACCEPT 2>/dev/null || \
         iptables -I INPUT 1 -p udp --dport "${LISTEN_PORT}" -j ACCEPT
 
-    # Allow established connections
     iptables -C INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
         iptables -I INPUT 1 -m state --state ESTABLISHED,RELATED -j ACCEPT
 
-    # IPv6 rules
     ip6tables -C INPUT -p udp --dport "${LISTEN_PORT}" -j ACCEPT 2>/dev/null || \
         ip6tables -I INPUT 1 -p udp --dport "${LISTEN_PORT}" -j ACCEPT 2>/dev/null || true
 
-    # Persist iptables rules if iptables-persistent is available
     if command -v netfilter-persistent &>/dev/null; then
         netfilter-persistent save 2>/dev/null || true
     fi
@@ -234,7 +301,6 @@ setup_firewall() {
     sysctl -w net.core.rmem_default=1048576 > /dev/null 2>&1
     sysctl -w net.core.wmem_default=1048576 > /dev/null 2>&1
 
-    # Persist buffer settings
     for param in "net.core.rmem_max=16777216" "net.core.wmem_max=16777216" \
                  "net.core.rmem_default=1048576" "net.core.wmem_default=1048576"; do
         local key="${param%%=*}"
@@ -246,11 +312,10 @@ setup_firewall() {
     info "Firewall and network optimizations applied."
 }
 
-# ── Systemd service ────────────────────────────────────────────────────────
-setup_service() {
-    info "Creating systemd service..."
+# ── Systemd: Hysteria service ─────────────────────────────────────────────
+setup_hysteria_service() {
+    info "Creating Hysteria systemd service..."
 
-    # Stop any existing official hysteria services to avoid port conflicts
     systemctl stop hysteria-server.service 2>/dev/null || true
     systemctl disable hysteria-server.service 2>/dev/null || true
 
@@ -258,11 +323,13 @@ setup_service() {
 [Unit]
 Description=Hysteria 2 VPN Server
 Documentation=https://hysteria.network/
-After=network.target network-online.target
+After=network.target network-online.target ${BOT_SERVICE_NAME}.service
 Wants=network-online.target
+Requires=${BOT_SERVICE_NAME}.service
 
 [Service]
 Type=simple
+ExecStartPre=/bin/sleep 2
 ExecStart=${HYSTERIA_BIN} server --config ${CONFIG_FILE}
 Restart=always
 RestartSec=5
@@ -271,17 +338,14 @@ StartLimitBurst=10
 LimitNOFILE=65535
 LimitNPROC=65535
 
-# Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=${HYSTERIA_DIR}
 PrivateTmp=true
 
-# Watchdog
 WatchdogSec=30
 
-# Logging
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=hysteria
@@ -290,18 +354,79 @@ SyslogIdentifier=hysteria
 WantedBy=multi-user.target
 EOF
 
+    info "Hysteria service file created."
+}
+
+# ── Systemd: Bot service ──────────────────────────────────────────────────
+setup_bot_service() {
+    info "Creating Telegram bot systemd service..."
+
+    cat > "${BOT_SERVICE_FILE}" <<EOF
+[Unit]
+Description=Hysteria 2 Telegram Bot & Auth Backend
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=${BOT_DIR}
+Environment=HYSTERIA_BOT_CONFIG=${BOT_CONFIG_FILE}
+Environment=HYSTERIA_BOT_DATA=${BOT_DIR}
+ExecStart=${BOT_DIR}/venv/bin/python3 ${BOT_DIR}/bot.py
+Restart=always
+RestartSec=3
+StartLimitIntervalSec=60
+StartLimitBurst=15
+LimitNOFILE=65535
+
+NoNewPrivileges=true
+ProtectHome=true
+ReadWritePaths=${HYSTERIA_DIR}
+PrivateTmp=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hysteria-bot
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    info "Bot service file created."
+}
+
+# ── Start services ────────────────────────────────────────────────────────
+start_services() {
+    info "Starting services..."
+
     systemctl daemon-reload
+
+    # Start bot first (auth backend must be up before Hysteria)
+    systemctl enable "${BOT_SERVICE_NAME}" > /dev/null 2>&1
+    systemctl restart "${BOT_SERVICE_NAME}"
+
+    sleep 3
+
+    if systemctl is-active --quiet "${BOT_SERVICE_NAME}"; then
+        info "Bot service started successfully."
+    else
+        err "Bot service failed to start. Checking logs..."
+        journalctl -u "${BOT_SERVICE_NAME}" --no-pager -n 20
+        fatal "Bot service startup failed. Check your BOT_TOKEN."
+    fi
+
+    # Start Hysteria
     systemctl enable "${SERVICE_NAME}" > /dev/null 2>&1
     systemctl restart "${SERVICE_NAME}"
 
-    # Wait and verify
     sleep 2
+
     if systemctl is-active --quiet "${SERVICE_NAME}"; then
         info "Hysteria service started successfully."
     else
-        err "Service failed to start. Checking logs..."
+        err "Hysteria service failed to start. Checking logs..."
         journalctl -u "${SERVICE_NAME}" --no-pager -n 20
-        fatal "Service startup failed. See logs above."
+        fatal "Hysteria service startup failed. See logs above."
     fi
 }
 
@@ -320,11 +445,8 @@ echo "=== Update check: $(date) ==="
 
 CURRENT=$(/usr/local/bin/hysteria version 2>/dev/null | head -1 || echo "unknown")
 
-# Download latest
-TMPBIN=$(mktemp)
 bash <(curl -fsSL https://get.hy2.sh/) > /dev/null 2>&1 || {
     echo "Update download failed, keeping current version."
-    rm -f "${TMPBIN}"
     exit 0
 }
 
@@ -357,7 +479,8 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
 CONFIG="/etc/hysteria/config.yaml"
 SERVICE="hysteria-server"
-CERT_DIR="/etc/hysteria/certs"
+BOT_SERVICE="hysteria-bot"
+BOT_DIR="/etc/hysteria/bot"
 
 usage() {
     echo -e "${BOLD}Hysteria 2 VPN Management${NC}"
@@ -365,27 +488,29 @@ usage() {
     echo "Usage: hysteria-manage <command>"
     echo ""
     echo "Commands:"
-    echo "  status          Show service status"
-    echo "  start           Start the service"
-    echo "  stop            Stop the service"
-    echo "  restart         Restart the service"
-    echo "  logs [N]        Show last N log lines (default 50)"
-    echo "  change-key      Generate and set a new auth key"
-    echo "  change-obfs     Generate and set a new obfuscation password"
-    echo "  show-config     Display current server config"
-    echo "  show-client     Show client connection config"
-    echo "  stats           Show traffic stats (active connections)"
+    echo "  status          Show all services status"
+    echo "  start           Start all services"
+    echo "  stop            Stop all services"
+    echo "  restart         Restart all services"
+    echo "  logs [N]        Show last N Hysteria log lines (default 50)"
+    echo "  bot-logs [N]    Show last N bot log lines (default 50)"
+    echo "  show-config     Display server config"
+    echo "  stats           Show traffic stats"
     echo "  update          Update Hysteria to latest version"
-    echo "  uninstall       Remove Hysteria completely"
+    echo "  uninstall       Remove everything"
     echo ""
 }
 
 cmd_status() {
-    echo -e "${BOLD}=== Hysteria Service Status ===${NC}"
-    systemctl status "${SERVICE}" --no-pager 2>/dev/null || echo -e "${RED}Service not found${NC}"
+    echo -e "${BOLD}=== Hysteria Service ===${NC}"
+    systemctl status "${SERVICE}" --no-pager 2>/dev/null || echo -e "${RED}Not found${NC}"
+    echo ""
+    echo -e "${BOLD}=== Bot Service ===${NC}"
+    systemctl status "${BOT_SERVICE}" --no-pager 2>/dev/null || echo -e "${RED}Not found${NC}"
     echo ""
     echo -e "${BOLD}=== Port Listening ===${NC}"
-    ss -ulnp | grep -E ":(443|${LISTEN_PORT:-443})\b" || echo "No listening ports found."
+    ss -ulnp | grep ":443\b" 2>/dev/null || echo "No UDP listeners on 443"
+    ss -tlnp | grep ":8787\b" 2>/dev/null || echo "No TCP listeners on 8787 (auth backend)"
 }
 
 cmd_logs() {
@@ -393,40 +518,9 @@ cmd_logs() {
     journalctl -u "${SERVICE}" --no-pager -n "${lines}"
 }
 
-cmd_change_key() {
-    local new_key
-    new_key=$(openssl rand -hex 16)
-    sed -i "s/^  password: .*/  password: ${new_key}/" "${CONFIG}"
-    echo -e "${GREEN}New auth key: ${BOLD}${new_key}${NC}"
-    echo -e "${YELLOW}Restarting service...${NC}"
-    systemctl restart "${SERVICE}"
-    echo -e "${GREEN}Done. Update this key on all clients.${NC}"
-}
-
-cmd_change_obfs() {
-    local new_obfs
-    new_obfs=$(openssl rand -hex 16)
-    # Update the salamander password (the second 'password:' under obfs section)
-    python3 -c "
-import re, sys
-with open('${CONFIG}', 'r') as f:
-    content = f.read()
-# Replace salamander password
-content = re.sub(
-    r'(salamander:\s*\n\s*password:\s*)(\S+)',
-    r'\g<1>${new_obfs}',
-    content
-)
-with open('${CONFIG}', 'w') as f:
-    f.write(content)
-" 2>/dev/null || {
-    # Fallback if python3 not available
-    sed -i '/salamander:/,/password:/{s/password: .*/password: '"${new_obfs}"'/}' "${CONFIG}"
-    }
-    echo -e "${GREEN}New obfuscation password: ${BOLD}${new_obfs}${NC}"
-    echo -e "${YELLOW}Restarting service...${NC}"
-    systemctl restart "${SERVICE}"
-    echo -e "${GREEN}Done. Update this password on all clients.${NC}"
+cmd_bot_logs() {
+    local lines="${1:-50}"
+    journalctl -u "${BOT_SERVICE}" --no-pager -n "${lines}"
 }
 
 cmd_show_config() {
@@ -434,79 +528,24 @@ cmd_show_config() {
     cat "${CONFIG}"
 }
 
-cmd_show_client() {
-    local server_ip
-    server_ip=$(curl -4 -fsSL ifconfig.me 2>/dev/null || curl -4 -fsSL icanhazip.com 2>/dev/null || echo "YOUR_SERVER_IP")
-
-    local auth_key obfs_pass port
-    auth_key=$(grep -A1 "^auth:" "${CONFIG}" | grep "password:" | head -1 | awk '{print $2}')
-    obfs_pass=$(grep -A2 "salamander:" "${CONFIG}" | grep "password:" | tail -1 | awk '{print $2}')
-    port=$(grep "^listen:" "${CONFIG}" | sed 's/listen: ://' | tr -d '[:space:]')
-    [[ -z "${port}" ]] && port="443"
-
-    echo -e "${BOLD}=== Client Configuration ===${NC}"
-    echo ""
-    echo -e "${CYAN}Server IP:${NC}       ${server_ip}"
-    echo -e "${CYAN}Port:${NC}            ${port} (UDP)"
-    echo -e "${CYAN}Auth key:${NC}        ${auth_key}"
-    echo -e "${CYAN}Obfs type:${NC}       salamander"
-    echo -e "${CYAN}Obfs password:${NC}   ${obfs_pass}"
-    echo -e "${CYAN}TLS:${NC}             insecure (self-signed cert)"
-    echo ""
-    echo -e "${BOLD}=== Client config.yaml ===${NC}"
-    cat <<CLIENT_YAML
-
-server: ${server_ip}:${port}
-
-auth: ${auth_key}
-
-tls:
-  insecure: true
-
-obfs:
-  type: salamander
-  salamander:
-    password: ${obfs_pass}
-
-# Optional: set bandwidth for Brutal congestion control
-# bandwidth:
-#   up: 100 mbps
-#   down: 100 mbps
-
-socks5:
-  listen: 127.0.0.1:1080
-
-http:
-  listen: 127.0.0.1:8080
-
-CLIENT_YAML
-    echo ""
-    echo -e "${BOLD}=== Connection URI (for mobile apps) ===${NC}"
-    local uri="hy2://${auth_key}@${server_ip}:${port}?obfs=salamander&obfs-password=${obfs_pass}&insecure=1#Hysteria2-VPN"
-    echo -e "${GREEN}${uri}${NC}"
-    echo ""
-    echo -e "${YELLOW}Copy the URI above into Hysteria Android/iOS app.${NC}"
-}
-
 cmd_stats() {
-    local secret
-    secret=$(grep -A1 "trafficStats:" "${CONFIG}" | grep "secret:" | awk '{print $2}')
-    local stats_port
-    stats_port=$(grep -A1 "trafficStats:" "${CONFIG}" | grep "listen:" | sed 's/.*://' | tr -d '[:space:]')
+    local secret stats_port
+    secret=$(python3 -c "import json; print(json.load(open('${BOT_DIR}/bot.json'))['stats_secret'])" 2>/dev/null || echo "")
+    stats_port=$(python3 -c "import json; d=json.load(open('${BOT_DIR}/bot.json')); print(d.get('stats_listen','127.0.0.1:9090').split(':')[1])" 2>/dev/null || echo "9090")
 
     if [[ -z "${secret}" ]]; then
-        echo -e "${RED}Traffic stats API not configured.${NC}"
+        echo -e "${RED}Stats secret not found.${NC}"
         return 1
     fi
 
     echo -e "${BOLD}=== Active Connections ===${NC}"
     curl -s "http://127.0.0.1:${stats_port}/traffic?secret=${secret}" 2>/dev/null | jq . 2>/dev/null || \
-        echo -e "${YELLOW}No data available or service not running.${NC}"
+        echo -e "${YELLOW}No data or service not running.${NC}"
 
     echo ""
     echo -e "${BOLD}=== Online Users ===${NC}"
     curl -s "http://127.0.0.1:${stats_port}/online?secret=${secret}" 2>/dev/null | jq . 2>/dev/null || \
-        echo -e "${YELLOW}No data available or service not running.${NC}"
+        echo -e "${YELLOW}No data or service not running.${NC}"
 }
 
 cmd_update() {
@@ -520,25 +559,27 @@ cmd_update() {
     local new_ver
     new_ver=$(/usr/local/bin/hysteria version 2>/dev/null | head -1 || echo "unknown")
     echo -e "${GREEN}Updated: ${current} -> ${new_ver}${NC}"
-    echo -e "${YELLOW}Restarting service...${NC}"
     systemctl restart "${SERVICE}"
     echo -e "${GREEN}Done.${NC}"
 }
 
 cmd_uninstall() {
-    echo -e "${RED}${BOLD}WARNING: This will completely remove Hysteria 2 VPN.${NC}"
+    echo -e "${RED}${BOLD}WARNING: This will completely remove Hysteria 2 VPN + Bot.${NC}"
     read -rp "Are you sure? (yes/no): " confirm
     if [[ "${confirm}" != "yes" ]]; then
         echo "Aborted."
         return
     fi
 
-    echo "Stopping service..."
+    echo "Stopping services..."
     systemctl stop "${SERVICE}" 2>/dev/null || true
+    systemctl stop "${BOT_SERVICE}" 2>/dev/null || true
     systemctl disable "${SERVICE}" 2>/dev/null || true
+    systemctl disable "${BOT_SERVICE}" 2>/dev/null || true
 
     echo "Removing files..."
     rm -f "/etc/systemd/system/${SERVICE}.service"
+    rm -f "/etc/systemd/system/${BOT_SERVICE}.service"
     rm -rf /etc/hysteria
     rm -f /usr/local/bin/hysteria
     rm -f /usr/local/bin/hysteria-manage
@@ -546,20 +587,17 @@ cmd_uninstall() {
 
     systemctl daemon-reload
 
-    echo -e "${GREEN}Hysteria 2 has been completely removed.${NC}"
+    echo -e "${GREEN}Hysteria 2 + Bot completely removed.${NC}"
 }
 
-# ── Main ────────────────────────────────────────────────────────────────────
 case "${1:-}" in
     status)      cmd_status ;;
-    start)       systemctl start "${SERVICE}" && echo -e "${GREEN}Started.${NC}" ;;
-    stop)        systemctl stop "${SERVICE}" && echo -e "${YELLOW}Stopped.${NC}" ;;
-    restart)     systemctl restart "${SERVICE}" && echo -e "${GREEN}Restarted.${NC}" ;;
+    start)       systemctl start "${BOT_SERVICE}" && sleep 2 && systemctl start "${SERVICE}" && echo -e "${GREEN}Started.${NC}" ;;
+    stop)        systemctl stop "${SERVICE}" && systemctl stop "${BOT_SERVICE}" && echo -e "${YELLOW}Stopped.${NC}" ;;
+    restart)     systemctl restart "${BOT_SERVICE}" && sleep 2 && systemctl restart "${SERVICE}" && echo -e "${GREEN}Restarted.${NC}" ;;
     logs)        cmd_logs "${2:-50}" ;;
-    change-key)  cmd_change_key ;;
-    change-obfs) cmd_change_obfs ;;
+    bot-logs)    cmd_bot_logs "${2:-50}" ;;
     show-config) cmd_show_config ;;
-    show-client) cmd_show_client ;;
     stats)       cmd_stats ;;
     update)      cmd_update ;;
     uninstall)   cmd_uninstall ;;
@@ -573,81 +611,58 @@ MGMTEOF
 
 # ── Print summary ──────────────────────────────────────────────────────────
 print_summary() {
-    local server_ip
-    server_ip=$(curl -4 -fsSL ifconfig.me 2>/dev/null || curl -4 -fsSL icanhazip.com 2>/dev/null || echo "YOUR_SERVER_IP")
-
     echo ""
     echo -e "${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}║           Hysteria 2 VPN — Deployment Complete!             ║${NC}"
+    echo -e "${BOLD}║        Hysteria 2 VPN — Deployment Complete!                ║${NC}"
     echo -e "${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    echo -e "${CYAN}Server IP:${NC}            ${server_ip}"
+    echo -e "${CYAN}Server IP:${NC}            ${SERVER_IP}"
     echo -e "${CYAN}Port:${NC}                 ${LISTEN_PORT} (UDP)"
-    echo -e "${CYAN}Auth Key (PSK):${NC}       ${PSK}"
+    echo -e "${CYAN}Auth:${NC}                 Multi-key (via Telegram bot)"
     echo -e "${CYAN}Obfs Type:${NC}            Salamander"
     echo -e "${CYAN}Obfs Password:${NC}        ${OBFS_PASSWORD}"
     echo -e "${CYAN}TLS:${NC}                  Self-signed (insecure: true on client)"
     echo -e "${CYAN}Stats API:${NC}            http://127.0.0.1:${STATS_PORT}"
-    echo -e "${CYAN}Stats Secret:${NC}         ${STATS_SECRET}"
+    echo -e "${CYAN}Auth Backend:${NC}         http://127.0.0.1:${AUTH_BACKEND_PORT}"
     echo ""
-    echo -e "${BOLD}── Connection URI (for mobile apps) ──${NC}"
-    local uri="hy2://${PSK}@${server_ip}:${LISTEN_PORT}?obfs=salamander&obfs-password=${OBFS_PASSWORD}&insecure=1#Hysteria2-VPN"
-    echo -e "${GREEN}${uri}${NC}"
-    echo ""
-    echo -e "${BOLD}── Client config.yaml ──${NC}"
-    echo ""
-    echo "server: ${server_ip}:${LISTEN_PORT}"
-    echo ""
-    echo "auth: ${PSK}"
-    echo ""
-    echo "tls:"
-    echo "  insecure: true"
-    echo ""
-    echo "obfs:"
-    echo "  type: salamander"
-    echo "  salamander:"
-    echo "    password: ${OBFS_PASSWORD}"
-    echo ""
-    echo "socks5:"
-    echo "  listen: 127.0.0.1:1080"
-    echo ""
-    echo "http:"
-    echo "  listen: 127.0.0.1:8080"
+    echo -e "${BOLD}── Telegram Bot ──${NC}"
+    echo -e "  ${CYAN}Bot Token:${NC}          ${BOT_TOKEN:0:10}...${BOT_TOKEN: -5}"
+    echo -e "  ${CYAN}Admin Password:${NC}     ${ADMIN_PASSWORD}"
+    echo -e "  ${YELLOW}Open your bot in Telegram, send the password to get access.${NC}"
+    echo -e "  ${YELLOW}Then use the bot to create VPN keys for clients.${NC}"
     echo ""
     echo -e "${BOLD}── Management ──${NC}"
-    echo -e "  ${GREEN}hysteria-manage status${NC}       — service status"
-    echo -e "  ${GREEN}hysteria-manage show-client${NC}  — show client config & URI"
-    echo -e "  ${GREEN}hysteria-manage logs${NC}         — view logs"
+    echo -e "  ${GREEN}hysteria-manage status${NC}       — all services status"
+    echo -e "  ${GREEN}hysteria-manage logs${NC}         — Hysteria logs"
+    echo -e "  ${GREEN}hysteria-manage bot-logs${NC}     — Bot logs"
     echo -e "  ${GREEN}hysteria-manage stats${NC}        — traffic statistics"
-    echo -e "  ${GREEN}hysteria-manage change-key${NC}   — rotate auth key"
-    echo -e "  ${GREEN}hysteria-manage change-obfs${NC}  — rotate obfs password"
+    echo -e "  ${GREEN}hysteria-manage restart${NC}      — restart all services"
     echo -e "  ${GREEN}hysteria-manage update${NC}       — update Hysteria"
-    echo -e "  ${GREEN}hysteria-manage restart${NC}      — restart service"
     echo -e "  ${GREEN}hysteria-manage uninstall${NC}    — remove everything"
     echo ""
-    echo -e "${BOLD}── Important ──${NC}"
-    echo -e "  ${YELLOW}• Save the Auth Key and Obfs Password — you need them for clients${NC}"
-    echo -e "  ${YELLOW}• One key = unlimited devices${NC}"
-    echo -e "  ${YELLOW}• No traffic limits applied${NC}"
-    echo -e "  ${YELLOW}• Service auto-restarts on crash (systemd + watchdog)${NC}"
-    echo -e "  ${YELLOW}• Auto-updates daily via cron${NC}"
+    echo -e "${BOLD}── How It Works ──${NC}"
+    echo -e "  ${YELLOW}1. Open your Telegram bot${NC}"
+    echo -e "  ${YELLOW}2. Enter the admin password${NC}"
+    echo -e "  ${YELLOW}3. Create keys via the bot menu${NC}"
+    echo -e "  ${YELLOW}4. Bot gives you client config + URI for each key${NC}"
+    echo -e "  ${YELLOW}5. One key = unlimited devices, multiple keys supported${NC}"
     echo ""
 
-    # Save credentials to file
+    # Save credentials
     cat > "${HYSTERIA_DIR}/credentials.txt" <<CREDS
 # Hysteria 2 VPN Credentials
 # Generated: $(date)
 
-Server IP:       ${server_ip}
-Port:            ${LISTEN_PORT} (UDP)
-Auth Key:        ${PSK}
-Obfs Type:       Salamander
-Obfs Password:   ${OBFS_PASSWORD}
-Stats API:       http://127.0.0.1:${STATS_PORT}
-Stats Secret:    ${STATS_SECRET}
-
-Connection URI:
-${uri}
+Server IP:         ${SERVER_IP}
+Port:              ${LISTEN_PORT} (UDP)
+Auth:              Multi-key (via Telegram bot)
+Obfs Type:         Salamander
+Obfs Password:     ${OBFS_PASSWORD}
+Stats API:         http://127.0.0.1:${STATS_PORT}
+Stats Secret:      ${STATS_SECRET}
+Auth Backend:      http://127.0.0.1:${AUTH_BACKEND_PORT}
+Bot Token:         ${BOT_TOKEN}
+Admin Password:    ${ADMIN_PASSWORD}
 CREDS
     chmod 600 "${HYSTERIA_DIR}/credentials.txt"
     info "Credentials saved to ${HYSTERIA_DIR}/credentials.txt"
@@ -657,18 +672,23 @@ CREDS
 main() {
     echo ""
     echo -e "${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}║        Hysteria 2 VPN Server — One-Click Deployment         ║${NC}"
+    echo -e "${BOLD}║     Hysteria 2 VPN + Telegram Bot — One-Click Deployment    ║${NC}"
     echo -e "${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 
     preflight
+    ask_bot_config
     install_deps
     install_hysteria
     generate_secrets
+    detect_server_ip
     generate_cert
     write_config
+    install_bot
     setup_firewall
-    setup_service
+    setup_hysteria_service
+    setup_bot_service
+    start_services
     setup_autoupdate
     create_management_script
     print_summary

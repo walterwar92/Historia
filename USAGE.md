@@ -1,141 +1,145 @@
-# Hysteria 2 VPN — Руководство по использованию
+# Hysteria 2 VPN + Telegram Bot — Руководство
 
-## Быстрая установка на сервере
+## Быстрая установка
 
 ```bash
-# Загрузите deploy.sh на сервер Ubuntu 24.04 и запустите:
+# Загрузите папку проекта на сервер Ubuntu 24.04
+# Структура: deploy.sh + bot/ (рядом)
 chmod +x deploy.sh
 sudo ./deploy.sh
 ```
 
-Скрипт автоматически:
-1. Проверит, что ОС — Ubuntu 24.04
-2. Установит зависимости (curl, openssl, iptables, jq, cron)
+Скрипт запросит:
+1. **Telegram Bot Token** — получите у [@BotFather](https://t.me/BotFather)
+2. **Пароль администратора** — для доступа к боту
+
+Далее автоматически:
+1. Проверит Ubuntu 24.04
+2. Установит зависимости (curl, openssl, iptables, jq, cron, python3)
 3. Скачает Hysteria 2 (официальный установщик)
 4. Сгенерирует самоподписанный TLS-сертификат (10 лет)
-5. Сгенерирует PSK-ключ, пароль обфускации и секрет API
-6. Создаст оптимизированную конфигурацию с Salamander obfuscation
-7. Настроит iptables (UDP порт 443) и сетевые буферы
-8. Создаст systemd-сервис с автозапуском и watchdog
-9. Установит cron-задачу для ежедневного автообновления
-10. Установит утилиту управления `hysteria-manage`
+5. Сгенерирует пароль обфускации и секрет API
+6. Настроит Hysteria с HTTP auth backend (мульти-ключи)
+7. Установит Python-бота в виртуальное окружение
+8. Настроит iptables (UDP 443) и сетевые буферы
+9. Создаст 2 systemd-сервиса (Hysteria + Bot)
+10. Установит cron автообновление + утилиту `hysteria-manage`
 
-После установки на экране появятся **все данные для подключения**.
+---
+
+## Telegram Bot
+
+### Первый запуск
+
+1. Откройте вашего бота в Telegram
+2. Отправьте `/start`
+3. Введите **пароль администратора** (заданный при установке)
+4. Появится главное меню с inline-кнопками
+
+### Функции бота
+
+| Кнопка | Описание |
+|--------|----------|
+| **Создать ключ** | Генерирует уникальный VPN-ключ, показывает URI |
+| **Список ключей** | Все ключи со статусами |
+| **Конфиг клиента** | config.yaml + URI для конкретного ключа |
+| **Заблокировать** | Мгновенно отключает ключ |
+| **Разблокировать** | Возвращает ключ в работу |
+| **Удалить** | Удаляет ключ (с подтверждением) |
+| **Статус сервера** | systemd статус + количество ключей |
+| **Трафик** | Статистика трафика по сессиям |
+| **Онлайн** | Текущие подключения |
+| **Логи** | Последние строки журнала Hysteria |
+| **Перезапуск** | Перезапуск Hysteria (с подтверждением) |
+
+### Команды бота
+
+- `/start` — главное меню
+- `/menu` — повторно показать меню
+- `/logout` — выйти из сессии
+
+### Как это работает
+
+```
+Клиент ──► Hysteria (UDP 443) ──► Auth Backend (HTTP :8787) ──► SQLite БД
+                                        ▲
+                                        │
+                              Telegram Bot (управляет ключами)
+```
+
+1. Hysteria получает подключение с паролем (ключом)
+2. Hysteria отправляет POST на `http://127.0.0.1:8787/auth`
+3. Auth backend проверяет ключ в SQLite (активен? не истёк?)
+4. Если валиден — 200 OK, клиент подключен
+5. Если нет — 403, клиент отклонён
 
 ---
 
 ## Подключение клиентов
 
-### Один ключ = безлимит устройств
+### Каждый ключ = безлимит устройств
 
-Все клиенты используют один и тот же ключ. Количество одновременных подключений не ограничено.
+Создайте ключ через бота, получите URI и конфиг. Один ключ можно использовать на неограниченном количестве устройств.
 
 ### Android / iOS (Hysteria 2 App)
 
-1. Установите приложение Hysteria 2 из [Google Play](https://play.google.com/store/apps/details?id=io.nekohasekai.sfa) / App Store
-2. Импортируйте **Connection URI**, который показывается при установке:
+1. Установите Hysteria 2 из магазина приложений
+2. Скопируйте **URI** из бота (кнопка «Конфиг клиента»):
    ```
-   hy2://AUTH_KEY@SERVER_IP:443?obfs=salamander&obfs-password=OBFS_PASS&insecure=1#Hysteria2-VPN
+   hy2://KEY@SERVER_IP:443?obfs=salamander&obfs-password=OBFS&insecure=1#Hysteria2-VPN
    ```
-3. Или скопируйте URI командой на сервере:
-   ```bash
-   hysteria-manage show-client
-   ```
+3. Импортируйте URI в приложение
 
 ### Десктоп (CLI)
 
 1. Скачайте клиент: https://hysteria.network/docs/getting-started/Installation/
-2. Создайте файл `config.yaml`:
-
-```yaml
-server: SERVER_IP:443
-
-auth: YOUR_AUTH_KEY
-
-tls:
-  insecure: true
-
-obfs:
-  type: salamander
-  salamander:
-    password: YOUR_OBFS_PASSWORD
-
-socks5:
-  listen: 127.0.0.1:1080
-
-http:
-  listen: 127.0.0.1:8080
-```
-
+2. Скопируйте `config.yaml` из бота
 3. Запустите:
 ```bash
 ./hysteria client --config config.yaml
 ```
-
-4. Настройте браузер/систему на использование прокси:
+4. Прокси:
    - SOCKS5: `127.0.0.1:1080`
-   - HTTP:   `127.0.0.1:8080`
-
-### Опционально: Bandwidth (для Brutal congestion control)
-
-Если хотите использовать алгоритм Brutal вместо BBR, укажите реальную пропускную способность вашего канала в клиентском конфиге:
-
-```yaml
-bandwidth:
-  up: 50 mbps
-  down: 100 mbps
-```
+   - HTTP: `127.0.0.1:8080`
 
 ---
 
-## Управление сервером
-
-Утилита `hysteria-manage` устанавливается автоматически:
+## Управление сервером (CLI)
 
 | Команда | Описание |
 |---------|----------|
-| `hysteria-manage status` | Статус сервиса |
-| `hysteria-manage start` | Запустить сервис |
-| `hysteria-manage stop` | Остановить сервис |
-| `hysteria-manage restart` | Перезапустить |
-| `hysteria-manage logs` | Последние 50 строк логов |
-| `hysteria-manage logs 200` | Последние 200 строк логов |
-| `hysteria-manage show-config` | Показать конфигурацию сервера |
-| `hysteria-manage show-client` | Показать клиентский конфиг и URI |
-| `hysteria-manage stats` | Активные подключения и трафик |
-| `hysteria-manage change-key` | Сменить ключ аутентификации |
-| `hysteria-manage change-obfs` | Сменить пароль обфускации |
-| `hysteria-manage update` | Обновить Hysteria до последней версии |
-| `hysteria-manage uninstall` | Полностью удалить Hysteria |
+| `hysteria-manage status` | Статус обоих сервисов |
+| `hysteria-manage start` | Запустить всё |
+| `hysteria-manage stop` | Остановить всё |
+| `hysteria-manage restart` | Перезапустить всё |
+| `hysteria-manage logs` | Логи Hysteria (50 строк) |
+| `hysteria-manage logs 200` | Логи Hysteria (200 строк) |
+| `hysteria-manage bot-logs` | Логи бота |
+| `hysteria-manage show-config` | Конфигурация сервера |
+| `hysteria-manage stats` | Трафик и подключения |
+| `hysteria-manage update` | Обновить Hysteria |
+| `hysteria-manage uninstall` | Удалить всё |
 
 ---
 
 ## Отказоустойчивость
 
-- **Systemd**: автоматический перезапуск при падении (через 5 сек, до 10 раз в минуту)
-- **Watchdog**: systemd отслеживает процесс каждые 30 сек
-- **Автозапуск**: сервис стартует при загрузке ОС
-- **Автообновление**: ежедневная проверка новых версий через cron
+- **2 systemd-сервиса** с автоперезапуском
+- Hysteria: restart через 5 сек, до 10 раз/мин, watchdog 30s
+- Bot: restart через 3 сек, до 15 раз/мин
+- Hysteria зависит от бота (`Requires=hysteria-bot.service`)
+- Автозапуск при загрузке ОС
+- Ежедневное автообновление Hysteria через cron
 
 ---
 
 ## Безопасность
 
-- Конфигурация: `/etc/hysteria/config.yaml` (chmod 600)
-- Сертификаты: `/etc/hysteria/certs/` (ключ chmod 600)
-- Credentials: `/etc/hysteria/credentials.txt` (chmod 600)
-- Systemd hardening: `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`
-- Stats API слушает только на `127.0.0.1` (недоступен извне)
-
----
-
-## Сетевые оптимизации
-
-Скрипт автоматически применяет:
-- `net.ipv4.ip_forward=1` — IP forwarding
-- `net.core.rmem_max=16MB` — увеличенные буферы приёма
-- `net.core.wmem_max=16MB` — увеличенные буферы отправки
-- QUIC window: 16MB stream / 32MB connection
+- Конфигурации: chmod 600 (только root)
+- Auth backend и Stats API слушают только на 127.0.0.1
+- Systemd hardening: NoNewPrivileges, ProtectSystem=strict, ProtectHome, PrivateTmp
+- Пароль бота удаляется из чата после авторизации
+- SQLite БД ключей хранится в `/etc/hysteria/bot/keys.db`
 
 ---
 
@@ -147,31 +151,42 @@ bandwidth:
 | `/usr/local/bin/hysteria-manage` | Скрипт управления |
 | `/etc/hysteria/config.yaml` | Конфигурация сервера |
 | `/etc/hysteria/certs/` | TLS-сертификаты |
-| `/etc/hysteria/credentials.txt` | Сохранённые данные для подключения |
-| `/etc/systemd/system/hysteria-server.service` | Systemd unit |
-| `/etc/cron.daily/hysteria-update` | Скрипт автообновления |
-| `/var/log/hysteria-update.log` | Лог обновлений |
+| `/etc/hysteria/credentials.txt` | Все credentials |
+| `/etc/hysteria/bot/bot.py` | Telegram бот |
+| `/etc/hysteria/bot/bot.json` | Конфигурация бота |
+| `/etc/hysteria/bot/keys.db` | SQLite база ключей |
+| `/etc/hysteria/bot/venv/` | Python virtual environment |
+| `/etc/systemd/system/hysteria-server.service` | Сервис Hysteria |
+| `/etc/systemd/system/hysteria-bot.service` | Сервис бота |
+| `/etc/cron.daily/hysteria-update` | Автообновление |
 
 ---
 
 ## Устранение проблем
 
 ```bash
-# Проверить статус сервиса
+# Статус всех сервисов
 hysteria-manage status
 
-# Посмотреть логи
+# Логи Hysteria
 hysteria-manage logs 100
 
-# Проверить, слушает ли порт
-ss -ulnp | grep 443
+# Логи бота
+hysteria-manage bot-logs 100
 
-# Проверить firewall
+# Порты
+ss -ulnp | grep 443      # Hysteria (UDP)
+ss -tlnp | grep 8787     # Auth backend (TCP)
+
+# Firewall
 iptables -L -n | grep 443
 
-# Перезапустить
+# Перезапуск всего
 hysteria-manage restart
 
-# Тест подключения с клиента (если hysteria-cli установлен)
-hysteria ping --config config.yaml
+# Ручной тест auth backend
+curl -X POST http://127.0.0.1:8787/auth \
+  -H 'Content-Type: application/json' \
+  -d '{"addr":"1.2.3.4:1234","auth":"YOUR_KEY","tx":0,"rx":0}'
+# 200 = ключ валиден, 403 = отклонён
 ```
