@@ -86,7 +86,7 @@ sudo ./deploy.sh
 1. Установите Hysteria 2 из магазина приложений
 2. Скопируйте **URI** из бота (кнопка «Конфиг клиента»):
    ```
-   hy2://KEY@SERVER_IP:443?obfs=salamander&obfs-password=OBFS&insecure=1#Hysteria2-VPN
+   hy2://KEY@SERVER_IP:443?insecure=1#Hysteria2-VPN
    ```
 3. Импортируйте URI в приложение
 

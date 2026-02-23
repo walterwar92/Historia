@@ -221,20 +221,10 @@ def key_detail_kb(key_id: int, active: bool, role: str, is_owner: bool) -> Inlin
 def build_client_config(key: str) -> str:
     ip = cfg.get("server_ip", "YOUR_SERVER_IP")
     port = cfg.get("server_port", 443)
-    obfs = cfg.get("obfs_password", "")
     config_text = (
         f"server: {ip}:{port}\n\n"
         f"auth: {key}\n\n"
         f"tls:\n  insecure: true\n\n"
-    )
-    if obfs:
-        config_text += (
-            f"obfs:\n"
-            f"  type: salamander\n"
-            f"  salamander:\n"
-            f"    password: {obfs}\n\n"
-        )
-    config_text += (
         "quic:\n"
         "  initStreamReceiveWindow: 524288\n"
         "  maxStreamReceiveWindow: 2097152\n"
@@ -250,11 +240,7 @@ def build_client_config(key: str) -> str:
 def build_uri(key: str) -> str:
     ip = cfg.get("server_ip", "YOUR_SERVER_IP")
     port = cfg.get("server_port", 443)
-    obfs = cfg.get("obfs_password", "")
-    uri = f"hy2://{key}@{ip}:{port}?"
-    if obfs:
-        uri += f"obfs=salamander&obfs-password={obfs}&"
-    uri += "insecure=1#Hysteria2-VPN"
+    uri = f"hy2://{key}@{ip}:{port}?insecure=1#Hysteria2-VPN"
     return uri
 
 

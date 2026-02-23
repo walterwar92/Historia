@@ -2,7 +2,7 @@
 # ============================================================================
 #  Hysteria 2 + TrustTunnel VPN — One-Click Deploy Script for Ubuntu 24.04
 #  Protocols:
-#    Hysteria 2  — QUIC/UDP:443 — max speed, Salamander obfuscation
+#    Hysteria 2  — QUIC/UDP:443 — max speed
 #    TrustTunnel — HTTP/2 TCP:443 — DPI bypass, looks like regular HTTPS
 #  Features: Self-signed TLS, HTTP auth backend, multi-key via Telegram bot,
 #            systemd services, traffic stats API, auto-update, management CLI
@@ -37,7 +37,6 @@ LISTEN_PORT=443
 STATS_PORT=9090
 AUTH_BACKEND_PORT=8787
 STATS_SECRET=""
-OBFS_PASSWORD=""
 BOT_TOKEN=""
 ADMIN_PASSWORD=""
 SERVER_IP=""
@@ -174,9 +173,8 @@ install_trusttunnel() {
 
 # ── Generate secrets ───────────────────────────────────────────────────────
 generate_secrets() {
-    OBFS_PASSWORD=$(openssl rand -hex 16)
     STATS_SECRET=$(openssl rand -hex 16)
-    info "Generated obfuscation password and stats secret."
+    info "Generated stats secret."
 }
 
 # ── Detect server IP ──────────────────────────────────────────────────────
@@ -227,11 +225,6 @@ auth:
   http:
     url: http://127.0.0.1:${AUTH_BACKEND_PORT}/auth
     insecure: false
-
-obfs:
-  type: salamander
-  salamander:
-    password: ${OBFS_PASSWORD}
 
 # QUIC tuning — optimized for low latency
 quic:
@@ -355,7 +348,6 @@ install_bot() {
   "stats_secret": "${STATS_SECRET}",
   "server_ip": "${SERVER_IP}",
   "server_port": ${LISTEN_PORT},
-  "obfs_password": "${OBFS_PASSWORD}",
   "log_lines": 50,
   "tt_credentials_path": "${TT_CREDENTIALS}",
   "tt_service": "${TT_SERVICE_NAME}",
@@ -861,8 +853,6 @@ print_summary() {
     echo -e "${CYAN}Server IP:${NC}            ${SERVER_IP}"
     echo -e "${CYAN}Port:${NC}                 ${LISTEN_PORT} (UDP)"
     echo -e "${CYAN}Auth:${NC}                 Multi-key (via Telegram bot)"
-    echo -e "${CYAN}Obfs Type:${NC}            Salamander"
-    echo -e "${CYAN}Obfs Password:${NC}        ${OBFS_PASSWORD}"
     echo -e "${CYAN}TLS:${NC}                  Self-signed (insecure: true on client)"
     echo -e "${CYAN}Stats API:${NC}            http://127.0.0.1:${STATS_PORT}"
     echo -e "${CYAN}Auth Backend:${NC}         http://127.0.0.1:${AUTH_BACKEND_PORT}"
@@ -907,8 +897,6 @@ print_summary() {
 Server IP:         ${SERVER_IP}
 Port:              ${LISTEN_PORT} (UDP)
 Auth:              Multi-key (via Telegram bot)
-Obfs Type:         Salamander
-Obfs Password:     ${OBFS_PASSWORD}
 Stats API:         http://127.0.0.1:${STATS_PORT}
 Stats Secret:      ${STATS_SECRET}
 Auth Backend:      http://127.0.0.1:${AUTH_BACKEND_PORT}
